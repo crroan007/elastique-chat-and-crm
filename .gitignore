@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (keep structure, ignore actual data)
+data/*.db
+data/*.log.json
+*.log
+
+# Temp files
+temp_*
+*.tmp
+
+# Node (frontend)
+member_dashboard/node_modules/
+member_dashboard/.next/
+member_dashboard/.vercel/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (NEVER commit these)
+*.pem
+*.key
+service-account.json
+
+# Generated files
+static/protocols/*.pdf
+backend_url.txt
+gcloud_installer.exe
+
+# Archives
+*.zip
+*.rar
+*.tar.gz
+*.7z
+
+# Large Test Assets
+test_assets/
+
+
+# Large Dependencies & Externals
+external/
+crm_reference/
+Flowise-main/
+Training Data/
+Training Data - Copy/
+voice_copier/
+LivePortrait/
+SadTalker/
+gfpgan/
+models/
+node_modules/
+it_venv/
+
+# Archives (Explicit)
+twenty-main (1).zip
+Flowise-main.zip
+laravel-crm-2.1.zip
+monica-main.zip

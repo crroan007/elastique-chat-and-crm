@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elastique | Lymphatic Wellness</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=Inter:wght@300;400;600&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/widget.css">
+</head>
+
+<body>
+
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="logo">Elastique</div>
+        <ul class="nav-links">
+            <li><a href="#">Science</a></li>
+            <li><a href="#">Protocols</a></li>
+            <li><a href="#">Shop</a></li>
+            <li><a href="#" class="btn-consult">Book Consult</a></li>
+        </ul>
+    </nav>
+
+    <!-- Hero Section -->
+    <header class="hero">
+        <video id="hero-video" autoplay muted playsinline>
+            <source src="/static/hero.mp4" type="video/mp4">
+        </video>
+        <div class="hero-overlay"></div> <!-- Gradient overlay for text readability -->
+
+        <div class="hero-content">
+            <h1>The Science of <br><em>Wellness</em></h1>
+            <p>Medical-grade compression and lymphatic protocols designed for modern life.</p>
+            <button class="cta-button" onclick="window.elastiqueWidget.open()">Start Free Assessment</button>
+        </div>
+    </header>
+
+    <script>
+        // Video Fade Logic: Fade out last 2 seconds
+        const video = document.getElementById('hero-video');
+
+        video.addEventListener('timeupdate', () => {
+            if (!video.duration) return;
+            const timeLeft = video.duration - video.currentTime;
+
+            // "Shave off" last 1 second: HIDE it completely.
+            if (timeLeft <= 1) {
+                video.style.opacity = '0';
+            }
+            // Fade out the second BEFORE that (from T-2 to T-1)
+            else if (timeLeft <= 2) {
+                video.style.opacity = (timeLeft - 1);
+            }
+            else {
+                if (video.style.opacity !== '1') video.style.opacity = '1';
+            }
+        });
+
+        // Reset opacity on loop
+        video.addEventListener('loop', () => {
+            video.style.opacity = '0'; // Start hidden? OR snap on?
+            // Usually for seamless we want opacity 1. 
+            // But if we faded to 0, snapping to 1 is jarring.
+            // Assuming the user wants a fade *transition* or effect.
+            // I will snap it to 1 for now as 'fade out' is the only request.
+            video.style.opacity = '1';
+        });
+    </script>
+
+    <!-- Content Sections -->
+    <section class="features">
+        <div class="feature">
+            <h3>Micro-Massage</h3>
+            <p>Patented texture stimulates flow.</p>
+        </div>
+        <div class="feature">
+            <h3>Graduated Compression</h3>
+            <p>Clinically proven pressure gradients.</p>
+        </div>
+        <div class="feature">
+            <h3>Daily Protocols</h3>
+            <p>Expert routines for long-term health.</p>
+        </div>
+    </section>
+
+    <!-- Chat Widget Embed -->
+    <div id="elastique-widget-container"></div>
+    <script src="/static/js/widget.js"></script>
+    <script>
+        // Initialize Widget
+        document.addEventListener('DOMContentLoaded', () => {
+            window.elastiqueWidget.init({
+                containerId: 'elastique-widget-container',
+                apiUrl: 'http://localhost:8000/chat',
+                botName: 'Sarah',
+                title: 'Lymphatic Wellness Guide'
+            });
+        });
+    </script>
+
+</body>
+
+</html>

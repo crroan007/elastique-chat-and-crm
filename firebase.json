@@ -1,0 +1,8 @@
+{
+    "hosting": {
+        "source": "member_dashboard",
+        "frameworksBackend": {
+            "region": "us-central1"
+        }
+    }
+}

@@ -1,0 +1,33 @@
+{
+  "persona": "Athletic Annie",
+  "session_id": "test_athletic_annie_1769025276",
+  "transcript": [
+    {
+      "step": 1,
+      "user": "I'm training for a 5K and want to prevent ankle swelling.",
+      "bot": "I'd love to help you with that! To make sure I give you the most accurate routine and save your progress, could you just share your **First Name and Email Address**? Then we can dive right into the details.",
+      "grade": {
+        "score": 4,
+        "reasons": [
+          "+Identity Gate Pushed",
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 2,
+      "user": "Annie. annie@run.com. Just want to keep my legs fresh.",
+      "bot": "Thanks Annie! I've saved your profile. That's exciting! It's great you're prioritizing movement. Let's support that active lifestyle and keep your body feeling light.\n\n**Here is the underlying mechanics:**\nYour lymphatic system is unique because **it doesn't have a heart to pump it** like your blood does. It relies entirely on movement. When fluid pools in the ankles, it means the return flow is struggling against gravity.\n\n**Here is a Science-Backed Routine tailored for you:**\n*   **Structured Calf Pump**    *Why?* This acts as your 'second heart' to manually pump fluid back up.  \n    *Do:* Standing heel raises + bent-knee heel raises.    _(Evidence Level B)_\n*   **Leg Elevation**    *Why?* This gives your system a break, letting gravity work *for* you.  \n    *Do:* Legs above heart with comfortable support.    _(Evidence Level B)_\n*   **Afternoon Walk**    *Why?* Rhythmic walking engages the foot pump with every step.  \n    *Do:* Treadmill or brisk walking to clear afternoon pooling.    _(Evidence Level B)_\n\n**Supportive Tool:**To make this habit easier, many clients use the **L'Original Leggings (Class 1)**.> *Micro-massage fabric that mimics manual lymphatic drainage with every step.*[Show Me](https://elastique.co/products/loriginals)\n\nDoes this routine feel manageable for you to start including this evening?",
+      "grade": {
+        "score": 8,
+        "reasons": [
+          "+Empathy Detected",
+          "+Science Reference Found",
+          "+Product Soft-Sell Found",
+          "+Depth of Education"
+        ]
+      }
+    }
+  ],
+  "overall_score": 6.0
+}

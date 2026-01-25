@@ -1,0 +1,40 @@
+==================================================
+EXISTING TABLES IN elastique.db
+==================================================
+  + campaigns (7 columns)
+  + contact_identities (6 columns)
+  + contact_notes (7 columns)
+  + contact_tags (5 columns)
+  + contacts (39 columns)
+  + conversation_metrics (9 columns)
+  + conversations (15 columns)
+  + daily_snapshots (7 columns)
+  + deal_history (6 columns)
+  + deals (12 columns)
+  + email_events (5 columns)
+  + email_sends (7 columns)
+  + email_templates (8 columns)
+  + issue_mentions (7 columns)
+  + messages (9 columns)
+  + order_items (6 columns)
+  + orders (7 columns)
+  + pipeline_stages (8 columns)
+  + pipelines (6 columns)
+  + product_events (6 columns)
+  + product_views (5 columns)
+  + segments (6 columns)
+  + support_tickets (8 columns)
+  + ticket_history (6 columns)
+  + timeline_events (9 columns)
+  + workflow_executions (11 columns)
+  + workflow_steps (7 columns)
+  + workflows (12 columns)
+
+==================================================
+SCHEMA GAPS (Tables NOT yet created)
+==================================================
+  + EXISTS: workflows
+  + EXISTS: workflow_executions
+  + EXISTS: contact_tags
+  + EXISTS: email_events
+  + EXISTS: email_templates

@@ -1,0 +1,41 @@
+{
+  "persona": "Eager Sarah",
+  "session_id": "test_eager_sarah_1769019222",
+  "transcript": [
+    {
+      "step": 1,
+      "user": "Hi Sarah, it's Sarah! sarah@test.com",
+      "bot": "Thanks Hi Sarah, it's Sarah!! I've saved your profile. Now, **tell me a bit about what's going on in your body today?** (e.g., are you dealing with swelling, recovering from surgery, or just looking for general wellness?)",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 2,
+      "user": "My ankles are swollen after dancing.",
+      "bot": "I hear you. Heavy legs at the end of the day are a classic sign that gravity is winning the battle against your circulation.\n\n**Here is the underlying mechanics:**\nYour lymphatic system is unique because **it doesn't have a heart to pump it** like your blood does. It relies entirely on movement. When fluid pools in the ankles, it means the return flow is struggling against gravity.\n\n**Here is a Science-Backed Routine tailored for you:**\n*   **Structured Calf Pump**    *Why?* This acts as your 'second heart' to manually pump fluid back up.  \n    *Do:* Standing heel raises + bent-knee heel raises.    _(Evidence Level B)_\n*   **Leg Elevation**    *Why?* This gives your system a break, letting gravity work *for* you.  \n    *Do:* Legs above heart with comfortable support.    _(Evidence Level B)_\n*   **Afternoon Walk**    *Why?* Rhythmic walking engages the foot pump with every step.  \n    *Do:* Treadmill or brisk walking to clear afternoon pooling.    _(Evidence Level B)_\n\n**Supportive Tool:**To make this habit easier, many clients use the **L'Original Leggings (Class 1)**.> *Micro-massage fabric that mimics manual lymphatic drainage with every step.*[Show Me](https://elastique.co/products/loriginals)\n\nDoes this routine feel manageable for you to start including this evening?",
+      "grade": {
+        "score": 8,
+        "reasons": [
+          "+Empathy Detected",
+          "+Science Reference Found",
+          "+Product Soft-Sell Found",
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 3,
+      "user": "Yes, I can do those steps.",
+      "bot": "Fantastic. I'm generating your **Personalized Wellness Protocol** PDF right now.\n\nWhile that processes, would you like to see the **Clinical Garments** that support this protocol, or speak to a **Specialist**?",
+      "grade": {
+        "score": 0,
+        "reasons": []
+      }
+    }
+  ],
+  "overall_score": 3.3333333333333335
+}

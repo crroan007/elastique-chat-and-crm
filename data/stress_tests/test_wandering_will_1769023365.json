@@ -1,0 +1,43 @@
+{
+  "persona": "Wandering Will",
+  "session_id": "test_wandering_will_1769023365",
+  "transcript": [
+    {
+      "step": 1,
+      "user": "Hi there. I was just telling my dog Buster about this. He's a golden retriever, loves the park.",
+      "bot": "Hello! I'm Sarah, your Lymphatic Wellness Guide. To get started, I just need your **First Name and Email Address** to build your profile.",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Identity Gate Pushed"
+        ]
+      }
+    },
+    {
+      "step": 2,
+      "user": "Will. will@ramble.com. Anyway, Buster chased a squirrel today. But yeah, my knee has been huge since the surgery.",
+      "bot": "Thanks Will! I've saved your profile. Now, **tell me a bit about what's going on in your body today?** (e.g., are you dealing with swelling, recovering from surgery, or just looking for general wellness?)",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 3,
+      "user": "Oh, and my aunt had surgery too. She lives in Florida. Is it hot there? But yes, I need to fix this swelling.",
+      "bot": "I understand completely. Post-op swelling is tricky because we want to move the fluid without disturbing the healing tissue.\n\n**Here is the goal:**\nYour body is currently in 'protection mode', holding onto fluid. Our goal is to gently open the 'drains' (near the collarbone) to create a vacuum effect, pulling that fluid away from the surgical site safely.\n\n**Here is a Science-Backed Routine tailored for you:**\n*   **Safety First MLD**    *Why?* This gentle skin stretching manually opens the initial lymph capillaries.  \n    *Do:* Focus ONLY on Supraclavicular (Neck) clearance to open exit pathways without touching surgical sites.    _(Evidence Level A)_\n*   **Compression Adherence**    Follow surgeon guidelines strictly.    _(Evidence Level Clinical Standard)_\n\n**Supportive Tool:**To make this habit easier, many clients use the **L'Original Leggings (Gentle)**.> *Consistent, gentle compression that manages fluid without restricting flow like medical-grade garments.*[Show Me](https://elastique.co/products/loriginals)\n\nDoes this routine feel manageable for you to start including this evening?",
+      "grade": {
+        "score": 8,
+        "reasons": [
+          "+Empathy Detected",
+          "+Science Reference Found",
+          "+Product Soft-Sell Found",
+          "+Depth of Education"
+        ]
+      }
+    }
+  ],
+  "overall_score": 4.0
+}

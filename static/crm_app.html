@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elastique CRM - Command Center</title>
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Phosphor Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    <style>
+        .timeline-line {
+            position: absolute;
+            left: 24px;
+            top: 0;
+            bottom: 0;
+            width: 2px;
+            background-color: #E5E7EB;
+            z-index: 0;
+        }
+
+        /* Hide scrollbar for clean look */
+        .no-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+
+        .no-scrollbar {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+    </style>
+</head>
+
+<body class="bg-gray-50 h-screen overflow-hidden text-slate-800 font-sans">
+    <div id="app" class="h-full flex flex-col">
+
+        <!-- Header -->
+        <header
+            class="bg-white border-b border-gray-200 h-16 flex items-center px-6 justify-between flex-shrink-0 z-10">
+            <div class="flex items-center gap-4">
+                <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold">E
+                </div>
+                <h1 class="text-lg font-semibold text-slate-800">Elastique <span
+                        class="text-slate-400 font-normal">Command Center</span></h1>
+            </div>
+            <div class="flex items-center gap-4">
+                <button class="text-sm font-medium text-slate-600 hover:text-blue-600">Reports</button>
+                <button class="text-sm font-medium text-slate-600 hover:text-blue-600">Settings</button>
+                <div class="w-8 h-8 rounded-full bg-slate-200"></div>
+            </div>
+        </header>
+
+        <!-- Main Content (Master-Detail) -->
+        <div class="flex-1 flex overflow-hidden">
+
+            <!-- LEFT: Smart List (Master) -->
+            <div class="w-96 bg-white border-r border-gray-200 flex flex-col flex-shrink-0">
+                <!-- Search/Filter -->
+                <div class="p-4 border-b border-gray-100 space-y-3">
+                    <div class="relative">
+                        <i class="ph ph-magnifying-glass absolute left-3 top-2.5 text-gray-400"></i>
+                        <input type="text" v-model="searchQuery" placeholder="Search contacts..."
+                            class="w-full pl-9 pr-3 py-2 bg-gray-50 border border-gray-200 rounded-md text-sm focus:outline-none focus:border-blue-500">
+                    </div>
+                    <div class="flex gap-2 text-xs overflow-x-auto no-scrollbar pb-1">
+                        <button @click="filter = 'all'"
+                            :class="{'bg-blue-100 text-blue-700 font-medium': filter === 'all', 'bg-gray-100 text-gray-600': filter !== 'all'}"
+                            class="px-3 py-1 rounded-full whitespace-nowrap">All</button>
+                        <button @click="filter = 'lead'"
+                            :class="{'bg-blue-100 text-blue-700 font-medium': filter === 'lead', 'bg-gray-100 text-gray-600': filter !== 'lead'}"
+                            class="px-3 py-1 rounded-full whitespace-nowrap">Leads</button>
+                        <button @click="filter = 'vip'"
+                            :class="{'bg-blue-100 text-blue-700 font-medium': filter === 'vip', 'bg-gray-100 text-gray-600': filter !== 'vip'}"
+                            class="px-3 py-1 rounded-full whitespace-nowrap">VIPs</button>
+                        <button @click="filter = 'customer'"
+                            :class="{'bg-blue-100 text-blue-700 font-medium': filter === 'customer', 'bg-gray-100 text-gray-600': filter !== 'customer'}"
+                            class="px-3 py-1 rounded-full whitespace-nowrap">Customers</button>
+                    </div>
+                </div>
+
+                <!-- List -->
+                <div class="flex-1 overflow-y-auto">
+                    <div v-for="contact in filteredContacts" :key="contact.id" @click="selectContact(contact.id)"
+                        :class="{'bg-blue-50 border-l-4 border-blue-600': selectedId === contact.id, 'border-l-4 border-transparent hover:bg-gray-50': selectedId !== contact.id}"
+                        class="p-4 border-b border-gray-100 cursor-pointer transition-colors group">
+                        <div class="flex justify-between items-start mb-1">
+                            <span class="font-semibold text-slate-800">{{ contact.first_name }} {{ contact.last_name
+                                }}</span>
+                            <span class="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 capitalize">{{
+                                contact.lifecycle_stage || 'Visitor' }}</span>
+                        </div>
+                        <div class="text-sm text-gray-500 mb-2 truncate">{{ contact.email }}</div>
+                        <div class="flex items-center gap-3 text-xs text-gray-400">
+                            <span class="flex items-center gap-1"><i class="ph ph-chart-line-up"></i> {{
+                                contact.engagement_score }}</span>
+                            <span v-if="contact.lifetime_value > 0" class="flex items-center gap-1 text-green-600"><i
+                                    class="ph ph-currency-dollar"></i> {{ contact.lifetime_value }}</span>
+                            <span class="ml-auto">{{ formatDateBrief(contact.last_seen_at) }}</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- RIGHT: Contact Dossier (Detail) -->
+            <div v-if="loading" class="flex-1 flex items-center justify-center bg-gray-50">
+                <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+            </div>
+
+            <div v-else-if="currentContact" class="flex-1 overflow-y-auto bg-gray-50 p-6">
+                <div class="max-w-5xl mx-auto grid grid-cols-12 gap-6">
+
+                    <!-- LEFT COLUMN: Profile & Identity -->
+                    <div class="col-span-4 space-y-6">
+                        <!-- Profile Card -->
+                        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                            <div class="text-center mb-6">
+                                <div
+                                    class="w-20 h-20 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full mx-auto flex items-center justify-center text-white text-2xl font-bold mb-3 shadow-lg">
+                                    {{ currentContact.first_name[0] }}{{ currentContact.last_name[0] }}
+                                </div>
+                                <h2 class="text-xl font-bold text-slate-800">{{ currentContact.first_name }} {{
+                                    currentContact.last_name }}</h2>
+                                <p class="text-sm text-gray-500">{{ currentContact.location_city }}, {{
+                                    currentContact.location_country }}</p>
+                            </div>
+
+                            <!-- Key Metrics -->
+                            <div class="grid grid-cols-3 gap-2 py-4 border-t border-b border-gray-100 mb-4">
+                                <div class="text-center">
+                                    <div class="text-xs text-gray-400 uppercase tracking-wider mb-1">Score</div>
+                                    <div class="font-bold text-slate-800 text-lg">{{ currentContact.engagement_score }}
+                                    </div>
+                                </div>
+                                <div class="text-center border-l border-gray-100">
+                                    <div class="text-xs text-gray-400 uppercase tracking-wider mb-1">LTV</div>
+                                    <div class="font-bold text-green-600 text-lg">${{ currentContact.lifetime_value }}
+                                    </div>
+                                </div>
+                                <div class="text-center border-l border-gray-100">
+                                    <div class="text-xs text-gray-400 uppercase tracking-wider mb-1">Risk</div>
+                                    <div :class="currentContact.churn_risk > 0.5 ? 'text-red-500' : 'text-gray-400'"
+                                        class="font-bold text-lg">{{ currentContact.churn_risk }}</div>
+                                </div>
+                            </div>
+
+                            <!-- Contact Info -->
+                            <div class="space-y-3">
+                                <div class="flex items-center gap-3 text-sm">
+                                    <div
+                                        class="w-8 h-8 rounded bg-gray-50 flex items-center justify-center text-gray-400 flex-shrink-0">
+                                        <i class="ph ph-envelope-simple"></i></div>
+                                    <span class="truncate">{{ currentContact.email }}</span>
+                                </div>
+                                <div class="flex items-center gap-3 text-sm">
+                                    <div
+                                        class="w-8 h-8 rounded bg-gray-50 flex items-center justify-center text-gray-400 flex-shrink-0">
+                                        <i class="ph ph-map-pin"></i></div>
+                                    <span class="truncate">{{ currentContact.timezone || 'Unknown Timezone' }}</span>
+                                </div>
+                                <div class="flex items-center gap-3 text-sm">
+                                    <div
+                                        class="w-8 h-8 rounded bg-gray-50 flex items-center justify-center text-gray-400 flex-shrink-0">
+                                        <i class="ph ph-fingerprint"></i></div>
+                                    <span class="truncate text-gray-400 font-mono text-xs">{{
+                                        currentContact.id.substring(0,8) }}...</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Medical/Behavioral Tags -->
+                        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+                            <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Intelligence</h3>
+
+                            <div class="mb-4">
+                                <div class="text-xs text-gray-400 mb-2">Concerns</div>
+                                <div class="flex flex-wrap gap-2">
+                                    <span v-for="tag in currentContact.primary_concerns" :key="tag"
+                                        class="px-2 py-1 bg-red-50 text-red-600 rounded text-xs font-medium border border-red-100">{{
+                                        tag }}</span>
+                                    <span v-if="!currentContact.primary_concerns?.length"
+                                        class="text-xs text-gray-300 italic">No concerns detected</span>
+                                </div>
+                            </div>
+
+                            <div class="mb-4">
+                                <div class="text-xs text-gray-400 mb-2">Products of Interest</div>
+                                <div class="flex flex-wrap gap-2">
+                                    <span v-for="prod in currentContact.products_interested" :key="prod"
+                                        class="px-2 py-1 bg-indigo-50 text-indigo-600 rounded text-xs font-medium border border-indigo-100">{{
+                                        prod }}</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- RIGHT COLUMN: The Unified Timeline -->
+                    <div class="col-span-8">
+                        <div class="bg-white rounded-xl shadow-sm border border-gray-200 min-h-[600px] flex flex-col">
+                            <!-- Timeline Header / Actions -->
+                            <div
+                                class="p-4 border-b border-gray-100 flex justify-between items-center bg-slate-50 rounded-t-xl">
+                                <h3 class="font-semibold text-slate-700">Activity Timeline</h3>
+                                <div class="flex gap-2">
+                                    <button @click="showNoteInput = !showNoteInput"
+                                        class="px-3 py-1.5 bg-white border border-gray-300 rounded-md text-sm shadow-sm hover:bg-gray-50">
+                                        <i class="ph ph-note-pencil mr-1"></i> Add Note
+                                    </button>
+                                    <button
+                                        class="px-3 py-1.5 bg-blue-600 text-white rounded-md text-sm shadow-sm hover:bg-blue-700">
+                                        <i class="ph ph-ticket mr-1"></i> New Ticket
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Note Input -->
+                            <div v-if="showNoteInput"
+                                class="p-4 bg-yellow-50 border-b border-yellow-100 animate-fade-in">
+                                <textarea v-model="newNoteContent"
+                                    placeholder="Log a call, email summary, or internal note..."
+                                    class="w-full p-3 border border-yellow-200 rounded-md text-sm bg-white focus:outline-none focus:border-yellow-400 mb-2 h-20"></textarea>
+                                <div class="flex justify-end gap-2">
+                                    <button @click="showNoteInput = false"
+                                        class="text-xs text-gray-500 hover:text-gray-700">Cancel</button>
+                                    <button @click="saveNote"
+                                        class="px-3 py-1 bg-yellow-400 text-yellow-900 rounded-md text-xs font-semibold hover:bg-yellow-500">Save
+                                        Note</button>
+                                </div>
+                            </div>
+
+                            <!-- Timeline Feed -->
+                            <div class="p-6 relative">
+                                <div class="timeline-line"></div>
+                                <div class="space-y-8 relative z-10">
+
+                                    <div v-for="(event, idx) in currentContact.timeline" :key="idx"
+                                        class="flex gap-4 group">
+                                        <!-- Icon -->
+                                        <div class="w-12 flex-shrink-0 flex justify-center">
+                                            <div :class="{
+                                                'bg-blue-100 text-blue-600': event.timeline_type === 'chat_session',
+                                                'bg-yellow-100 text-yellow-600': event.timeline_type === 'note',
+                                                'bg-purple-100 text-purple-600': event.timeline_type === 'ticket',
+                                                'bg-green-100 text-green-600': event.timeline_type === 'deal'
+                                            }"
+                                                class="w-8 h-8 rounded-full flex items-center justify-center border-4 border-white shadow-sm">
+                                                <i class="ph text-sm" :class="{
+                                                    'ph-chat-circle-dots': event.timeline_type === 'chat_session',
+                                                    'ph-note': event.timeline_type === 'note',
+                                                    'ph-ticket': event.timeline_type === 'ticket',
+                                                    'ph-handshake': event.timeline_type === 'deal'
+                                                }"></i>
+                                            </div>
+                                        </div>
+
+                                        <!-- Content -->
+                                        <div
+                                            class="flex-1 bg-white border border-gray-100 rounded-lg p-4 shadow-sm hover:shadow-md transition-shadow">
+                                            <div class="flex justify-between items-start mb-2">
+                                                <span class="text-xs font-bold uppercase tracking-wider" :class="{
+                                                    'text-blue-600': event.timeline_type === 'chat_session',
+                                                    'text-yellow-600': event.timeline_type === 'note',
+                                                    'text-purple-600': event.timeline_type === 'ticket',
+                                                    'text-green-600': event.timeline_type === 'deal'
+                                                }">
+                                                    {{ event.timeline_type.replace('_', ' ') }}
+                                                </span>
+                                                <span class="text-xs text-gray-400">{{ formatTimestamp(event.created_at
+                                                    || event.started_at) }}</span>
+                                            </div>
+
+                                            <!-- Dynamic Body based on Type -->
+                                            <div v-if="event.timeline_type === 'note'"
+                                                class="text-sm text-gray-700 bg-yellow-50 p-3 rounded border border-yellow-100">
+                                                {{ event.content }}
+                                            </div>
+
+                                            <div v-else-if="event.timeline_type === 'chat_session'">
+                                                <div class="text-sm font-medium text-slate-800 mb-1">{{
+                                                    event.primary_intent || 'General Inquiry' }}</div>
+                                                <div class="text-xs text-gray-500 mb-2">{{ event.message_count }}
+                                                    messages exchanged. Status: {{ event.resolution_status }}</div>
+                                                <button
+                                                    class="text-xs text-blue-600 hover:text-blue-800 font-medium">View
+                                                    Transcript →</button>
+                                            </div>
+
+                                            <div v-else-if="event.timeline_type === 'deal'">
+                                                <div class="text-sm text-slate-800">
+                                                    Deal Stage: <span
+                                                        class="font-bold bg-green-50 text-green-700 px-1 rounded">{{
+                                                        event.stage }}</span>
+                                                </div>
+                                                <div class="text-xs text-gray-500">Value: ${{ event.amount }}</div>
+                                            </div>
+
+                                            <div v-else-if="event.timeline_type === 'ticket'">
+                                                <div class="text-sm font-medium text-slate-800">{{ event.subject }}
+                                                </div>
+                                                <div class="text-xs text-gray-500 line-clamp-2">{{ event.description }}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div v-if="currentContact.timeline.length === 0"
+                                        class="text-center py-10 text-gray-400 italic">
+                                        No history found for this contact.
+                                    </div>
+
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Empty State -->
+            <div v-else class="flex-1 flex flex-col items-center justify-center bg-gray-50 text-gray-400">
+                <i class="ph ph-user-circle text-6xl mb-4 text-gray-300"></i>
+                <p>Select a contact to view their dossier</p>
+            </div>
+
+        </div>
+    </div>
+
+    <script>
+        const { createApp } = Vue
+
+        createApp({
+            data() {
+                return {
+                    contacts: [],
+                    loading: false,
+                    selectedId: null,
+                    currentContact: null,
+                    searchQuery: '',
+                    filter: 'all',
+                    showNoteInput: false,
+                    newNoteContent: ''
+                }
+            },
+            computed: {
+                filteredContacts() {
+                    let res = this.contacts;
+                    if (this.filter !== 'all') {
+                        res = res.filter(c => c.lifecycle_stage === this.filter);
+                    }
+                    if (this.searchQuery) {
+                        const q = this.searchQuery.toLowerCase();
+                        res = res.filter(c => (c.first_name + ' ' + c.last_name + c.email).toLowerCase().includes(q));
+                    }
+                    return res;
+                }
+            },
+            methods: {
+                async fetchContacts() {
+                    const res = await fetch('/api/crm/contacts');
+                    this.contacts = await res.json();
+                },
+                async selectContact(id) {
+                    this.selectedId = id;
+                    this.loading = true;
+                    try {
+                        const res = await fetch(`/api/crm/contacts/${id}`);
+                        this.currentContact = await res.json();
+                    } finally {
+                        this.loading = false;
+                    }
+                },
+                async saveNote() {
+                    if (!this.newNoteContent.trim()) return;
+
+                    await fetch(`/api/crm/contacts/${this.selectedId}/notes`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content: this.newNoteContent, author_id: "Me" })
+                    });
+
+                    this.newNoteContent = '';
+                    this.showNoteInput = false;
+                    // Refresh
+                    this.selectContact(this.selectedId);
+                },
+                formatTimestamp(ts) {
+                    if (!ts) return '';
+                    const d = new Date(ts);
+                    return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                },
+                formatDateBrief(ts) {
+                    if (!ts) return '';
+                    const d = new Date(ts);
+                    const now = new Date();
+                    if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    return d.toLocaleDateString();
+                }
+            },
+            mounted() {
+                this.fetchContacts();
+            }
+        }).mount('#app')
+    </script>
+</body>
+
+</html>

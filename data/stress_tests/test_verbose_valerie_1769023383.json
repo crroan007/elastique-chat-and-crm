@@ -1,0 +1,41 @@
+{
+  "persona": "Verbose Valerie",
+  "session_id": "test_verbose_valerie_1769023383",
+  "transcript": [
+    {
+      "step": 1,
+      "user": "Hello. I have a very complicated history. It started in 1998 with a sprained ankle...",
+      "bot": "I'd love to help you with that! To make sure I give you the most accurate routine and save your progress, could you just share your **First Name and Email Address**? Then we can dive right into the details.",
+      "grade": {
+        "score": 4,
+        "reasons": [
+          "+Identity Gate Pushed",
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 2,
+      "user": "Valerie. val@verbose.com. Then in 2005 I had a C-section. Then in 2012 I broke my wrist. Now, specifically, I had liposuction on my thighs last week and the swelling is not going away. I've tried ice, heat, elevation, and prayer.",
+      "bot": "Thanks Valerie! I've saved your profile. Now, **tell me a bit about what's going on in your body today?** (e.g., are you dealing with swelling, recovering from surgery, or just looking for general wellness?)",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 3,
+      "user": "I just want to know if I should be walking or resting because my doctor said one thing but the internet says another.",
+      "bot": "Hi there! I'm Sarah. To give you the best recommendation, tell me a bit about what's going on.\n\nAre you managing **daily swelling/heaviness**, recovering from **surgery**, or looking for **general wellness**?",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Depth of Education"
+        ]
+      }
+    }
+  ],
+  "overall_score": 2.6666666666666665
+}

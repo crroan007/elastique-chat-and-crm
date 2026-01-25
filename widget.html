@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elastique Chatbot Widget</title>
+    <style>
+        /* --- WIDGET CONTAINER --- */
+        #elastique-chat-widget {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 9999;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        /* --- CHAT BUBBLE (LAUNCHER) --- */
+        #chat-bubble {
+            width: 60px;
+            height: 60px;
+            background-color: #6C5CE7;
+            /* GHL Purpleish */
+            border-radius: 50%;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        #chat-bubble:hover {
+            transform: scale(1.1);
+        }
+
+        #chat-bubble svg {
+            width: 30px;
+            height: 30px;
+            fill: white;
+        }
+
+        /* --- CHAT WINDOW --- */
+        #chat-window {
+            position: absolute;
+            bottom: 80px;
+            right: 0;
+            width: 350px;
+            height: 500px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 5px 20px rgba(0, 0, 0, 0.15);
+            display: none;
+            /* Hidden by default */
+            flex-direction: column;
+            overflow: hidden;
+            border: 1px solid #eee;
+        }
+
+        /* Header */
+        .chat-header {
+            background: #6C5CE7;
+            color: white;
+            padding: 15px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+        }
+
+        .chat-header img {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            background: white;
+            margin-right: 10px;
+        }
+
+        /* Messages Area */
+        .chat-messages {
+            flex: 1;
+            padding: 15px;
+            overflow-y: auto;
+            background: #f9f9f9;
+        }
+
+        /* Message Bubbles */
+        .message {
+            margin-bottom: 12px;
+            max-width: 80%;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+
+        .message.bot {
+            background: white;
+            color: #333;
+            border-bottom-left-radius: 2px;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+            margin-right: auto;
+        }
+
+        .message.user {
+            background: #6C5CE7;
+            color: white;
+            border-bottom-right-radius: 2px;
+            margin-left: auto;
+        }
+
+        /* Input Area */
+        .chat-input {
+            padding: 15px;
+            background: white;
+            border-top: 1px solid #eee;
+            display: flex;
+        }
+
+        .chat-input input {
+            flex: 1;
+            border: 1px solid #ddd;
+            border-radius: 20px;
+            padding: 10px 16px;
+            outline: none;
+            font-size: 14px;
+        }
+
+        .chat-input button {
+            background: none;
+            border: none;
+            color: #6C5CE7;
+            margin-left: 10px;
+            cursor: pointer;
+            font-weight: 700;
+        }
+
+        /* --- PRODUCT TILE STYLES (Reused from GHL) --- */
+        .ghl-product-tile {
+            font-family: inherit;
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- WIDGET CONTAINER -->
+    <div id="elastique-chat-widget">
+
+        <!-- CHAT WINDOW -->
+        <div id="chat-window">
+            <div class="chat-header">
+                <img src="https://ui-avatars.com/api/?name=AI&background=fff&color=00B894" alt="Bot">
+                <span>Elastique Support</span>
+            </div>
+
+            <div class="chat-messages" id="messages-container">
+                <!-- Initial Message -->
+                <div class="message bot">
+                    Hello! I can help you find leggings, bras, and recovery wear. What are you looking for?
+                </div>
+            </div>
+
+            <div class="chat-input">
+                <input type="text" id="user-input" placeholder="Type a message..." onkeypress="handleKeyPress(event)">
+                <button onclick="sendMessage()">Send</button>
+            </div>
+        </div>
+
+        <!-- LAUNCHER BUBBLE -->
+        <div id="chat-bubble" onclick="toggleChat()">
+            <!-- SVG Icon -->
+            <svg viewBox="0 0 24 24">
+                <path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z" />
+            </svg>
+        </div>
+
+    </div>
+
+    <!-- WIDGET LOGIC -->
+    <script>
+        const API_URL = "http://localhost:8000/chat"; // Local Python Server
+
+        function toggleChat() {
+            const window = document.getElementById('chat-window');
+            window.style.display = window.style.display === 'flex' ? 'none' : 'flex';
+        }
+
+        function handleKeyPress(e) {
+            if (e.key === 'Enter') sendMessage();
+        }
+
+        function appendMessage(text, sender, isHtml = false) {
+            const container = document.getElementById('messages-container');
+            const div = document.createElement('div');
+            div.className = `message ${sender}`;
+            if (isHtml) {
+                div.innerHTML = text; // For product tiles
+                div.style.background = "transparent"; // Remove background for tiles
+                div.style.padding = "0";
+                div.style.maxWidth = "100%";
+            } else {
+                div.innerText = text;
+            }
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('user-input');
+            const message = input.value.trim();
+            if (!message) return;
+
+            // 1. Show User Message
+            appendMessage(message, 'user');
+            input.value = '';
+
+            // 2. Call Python Backend
+            try {
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: message })
+                });
+                const data = await response.json();
+
+                // 3. Show Bot Reply
+                appendMessage(data.reply, 'bot');
+
+                // 4. Show Product Tile (if present)
+                if (data.product_card) {
+                    appendMessage(data.product_card, 'bot', true);
+                }
+
+            } catch (error) {
+                console.error("Error:", error);
+                appendMessage("Sorry, I can't connect to the server right now.", 'bot');
+            }
+        }
+    </script>
+
+</body>
+
+</html>

@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(python ghl_catalog_parser.py:*)",
+      "Bash(pip install:*)",
+      "Bash(python -m json.tool:*)"
+    ],
+    "deny": [],
+    "ask": []
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"c:\\Homebrew Apps\\Elastique - GPT_chatbot\" && git add -A && git commit -m \"auto: code changes\" && git push origin main 2>/dev/null || true",
+            "statusMessage": "Auto-committing changes to Git..."
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"c:\\Homebrew Apps\\Elastique - GPT_chatbot\" && git add -A && git commit -m \"auto: code changes\" && git push origin main 2>/dev/null || true",
+            "statusMessage": "Auto-committing changes to Git..."
+          }
+        ]
+      }
+    ]
+  }
+}

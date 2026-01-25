@@ -1,0 +1,42 @@
+{
+  "persona": "Verbose Valerie",
+  "session_id": "test_verbose_valerie_1769024038",
+  "transcript": [
+    {
+      "step": 1,
+      "user": "Hello. I have a very complicated history. It started in 1998 with a sprained ankle...",
+      "bot": "I'd love to help you with that! To make sure I give you the most accurate routine and save your progress, could you just share your **First Name and Email Address**? Then we can dive right into the details.",
+      "grade": {
+        "score": 4,
+        "reasons": [
+          "+Identity Gate Pushed",
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 2,
+      "user": "Valerie. val@verbose.com. Then in 2005 I had a C-section. Then in 2012 I broke my wrist. Now, specifically, I had liposuction on my thighs last week and the swelling is not going away. I've tried ice, heat, elevation, and prayer.",
+      "bot": "Thanks Valerie! I've saved your profile. I understand completely. Post-op swelling is tricky because we want to move the fluid without disturbing the healing tissue.\n\n**Here is the goal:**\nYour body is currently in 'protection mode', holding onto fluid. Our goal is to gently open the 'drains' (near the collarbone) to create a vacuum effect, pulling that fluid away from the surgical site safely.\n\n**Here is a Science-Backed Routine tailored for you:**\n*   **Safety First MLD**    *Why?* This gentle skin stretching manually opens the initial lymph capillaries.  \n    *Do:* Focus ONLY on Supraclavicular (Neck) clearance to open exit pathways without touching surgical sites.    _(Evidence Level A)_\n*   **Compression Adherence**    Follow surgeon guidelines strictly.    _(Evidence Level Clinical Standard)_\n\n**Supportive Tool:**To make this habit easier, many clients use the **L'Original Leggings (Gentle)**.> *Consistent, gentle compression that manages fluid without restricting flow like medical-grade garments.*[Show Me](https://elastique.co/products/loriginals)\n\nDoes this routine feel manageable for you to start including this evening?",
+      "grade": {
+        "score": 8,
+        "reasons": [
+          "+Empathy Detected",
+          "+Science Reference Found",
+          "+Product Soft-Sell Found",
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 3,
+      "user": "I just want to know if I should be walking or resting because my doctor said one thing but the internet says another.",
+      "bot": "No problem. Which part feels difficult? We can adjust the dose.",
+      "grade": {
+        "score": 0,
+        "reasons": []
+      }
+    }
+  ],
+  "overall_score": 4.0
+}

@@ -1,0 +1,40 @@
+{
+  "persona": "Skeptical Simon",
+  "session_id": "test_skeptical_simon_1769019231",
+  "transcript": [
+    {
+      "step": 1,
+      "user": "Hi. Why should I trust this bot?",
+      "bot": "Hello! I'm Sarah, your Lymphatic Wellness Guide. To get started, I just need your **First Name and Email Address** to build your profile.",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Identity Gate Pushed"
+        ]
+      }
+    },
+    {
+      "step": 2,
+      "user": "Simon, simon@skeptic.com. Now tell me about surgery recovery.",
+      "bot": "Thanks Simon,  Now tell me about surgery recovery.! I've saved your profile. Now, **tell me a bit about what's going on in your body today?** (e.g., are you dealing with swelling, recovering from surgery, or just looking for general wellness?)",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 3,
+      "user": "Show me the proof that movement helps.",
+      "bot": "Hi there! I'm Sarah. To give you the best recommendation, tell me a bit about what's going on.\n\nAre you managing **daily swelling/heaviness**, recovering from **surgery**, or looking for **general wellness**?",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Depth of Education"
+        ]
+      }
+    }
+  ],
+  "overall_score": 2.0
+}

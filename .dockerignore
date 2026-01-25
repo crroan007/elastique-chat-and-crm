@@ -1,0 +1,13 @@
+# Ignore for deployment
+node_modules/
+.next/
+.git/
+crm_reference/
+__pycache__/
+*.pyc
+.env
+.env.local
+*.log
+tests/
+*.md
+*.zip

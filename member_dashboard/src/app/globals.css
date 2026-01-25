@@ -1,0 +1,128 @@
+/* Tailwind v4: CSS-based configuration */
+@import "tailwindcss";
+
+/* Custom Theme - Elastique Light + Futuristic */
+@theme {
+    --color-primary: #2C3E50;
+    --color-accent: #00B894;
+    --color-accent-light: #55EFC4;
+    --color-background: #F8FAFB;
+    --color-surface: #FFFFFF;
+    --color-surface-alt: #F0F4F5;
+    --color-foreground: #2C3E50;
+    --color-muted: #636E72;
+    --color-border: #E8EDEF;
+}
+
+/* Global Styles */
+body {
+    background: var(--color-background);
+    color: var(--color-foreground);
+    font-family: 'Inter', sans-serif;
+}
+
+/* ===== FUTURISTIC DESIGN SYSTEM ===== */
+
+/* Chamfered Panel - Cut corners using clip-path */
+.panel-chamfered {
+    clip-path: polygon(0 0,
+            /* top-left */
+            100% 0,
+            /* top-right */
+            100% calc(100% - 16px),
+            /* bottom-right before cut */
+            calc(100% - 16px) 100%,
+            /* cut corner */
+            0 100%
+            /* bottom-left */
+        );
+}
+
+/* Chamfered Panel - Alternate (top-right cut) */
+.panel-chamfered-alt {
+    clip-path: polygon(0 0,
+            calc(100% - 16px) 0,
+            100% 16px,
+            100% 100%,
+            0 100%);
+}
+
+/* Floating Depth - Multi-layer shadows */
+.depth-1 {
+    box-shadow:
+        0 1px 2px rgba(0, 0, 0, 0.02),
+        0 2px 4px rgba(0, 0, 0, 0.02),
+        0 4px 8px rgba(0, 0, 0, 0.02);
+}
+
+.depth-2 {
+    box-shadow:
+        0 2px 4px rgba(0, 0, 0, 0.02),
+        0 4px 8px rgba(0, 0, 0, 0.03),
+        0 8px 16px rgba(0, 0, 0, 0.03),
+        0 16px 32px rgba(0, 0, 0, 0.02);
+}
+
+.depth-3 {
+    box-shadow:
+        0 4px 8px rgba(0, 0, 0, 0.02),
+        0 8px 16px rgba(0, 0, 0, 0.03),
+        0 16px 32px rgba(0, 0, 0, 0.04),
+        0 32px 64px rgba(0, 0, 0, 0.03);
+}
+
+/* Hover lift effect */
+.lift-hover {
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.lift-hover:hover {
+    transform: translateY(-2px);
+    box-shadow:
+        0 4px 8px rgba(0, 0, 0, 0.03),
+        0 8px 16px rgba(0, 0, 0, 0.04),
+        0 16px 32px rgba(0, 0, 0, 0.05),
+        0 32px 64px rgba(0, 0, 0, 0.04);
+}
+
+/* Accent Glow Border */
+.glow-border {
+    position: relative;
+}
+
+.glow-border::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    background: linear-gradient(135deg, var(--color-accent), var(--color-accent-light));
+    z-index: -1;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+}
+
+.glow-border:hover::before {
+    opacity: 1;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+    width: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #DFE6E9;
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #B2BEC3;
+}
+
+/* Sharp edges for selected state */
+.selected-edge {
+    border-left: 3px solid var(--color-accent);
+}

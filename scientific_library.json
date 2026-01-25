@@ -1,0 +1,89 @@
+[
+    {
+        "category": "Running & High Impact",
+        "mechanism": "Muscle Oscillation Reduction",
+        "facts": [
+            {
+                "statement": "Compression garments significantly reduce muscle oscillation (vibration) during impact, which decreases muscle fatigue and micro-trauma.",
+                "citation": "Impact of Lower Limb Compression Garments on Muscle Oscillation. Ohio State University Wexner Medical Center.",
+                "url": "https://wexnermedical.osu.edu/sports-medicine",
+                "confidence": "High"
+            },
+            {
+                "statement": "Compression aids in the flushing of lactate and metabolic waste during active recovery.",
+                "citation": "Evaluation of Compression Garments for Recovery. Journal of Applied Physiology.",
+                "confidence": "High"
+            }
+        ],
+        "recommended_collection": "The Fierce Collection, L'Original Leggings"
+    },
+    {
+        "category": "Yoga & Pilates",
+        "mechanism": "Proprioception & Joint Stability",
+        "facts": [
+            {
+                "statement": "Compression provides 'Second Skin' tactile feedback, enhancing proprioception (body awareness) and joint alignment during complex movements.",
+                "citation": "Influence of Compression Garments on Joint Reposition Sense. ResearchGate / IonicFire Review.",
+                "confidence": "Moderate"
+            },
+            {
+                "statement": "Reduced tissue vibration generally supports tendon and ligament stability during deep stretching.",
+                "citation": "ShopVitality Biomechanics Review.",
+                "confidence": "General Consensus"
+            }
+        ],
+        "recommended_collection": "Lisse Collection, Adorn Bodysuit"
+    },
+    {
+        "category": "Equestrian Sports",
+        "mechanism": "Rider Circulation & Stability",
+        "facts": [
+            {
+                "statement": "Compression supports lymphatic return in the pelvis and legs, countering the stagnation from prolonged seated posture in the saddle.",
+                "citation": "Equine & Rider Physiology Review. Mequicine.",
+                "confidence": "Expert Consensus"
+            },
+            {
+                "statement": "Supports lower back and core stability for rider posture.",
+                "citation": "Horse Pilot Rider Performance Study.",
+                "confidence": "Moderate"
+            }
+        ],
+        "recommended_collection": "L'Original Leggings (Structure), Iconic Bodysuits"
+    },
+    {
+        "category": "Travel & Flying",
+        "mechanism": "DVT & Edema Prevention",
+        "facts": [
+            {
+                "statement": "Graduated compression offers a 90% risk reduction in symptomless DVT for high-risk passengers on flights >4 hours.",
+                "citation": "Cochrane Database of Systematic Reviews. Clarke MJ et al.",
+                "url": "https://www.cochranelibrary.com",
+                "confidence": "Clinical Standard"
+            },
+            {
+                "statement": "Significant reduction in lower cell ankle edema compared to non-compression control groups.",
+                "citation": "Journal of Travel Medicine.",
+                "confidence": "High"
+            }
+        ],
+        "recommended_collection": "L'Original Leggings (Gradient Compression), Lisse Leggings"
+    },
+    {
+        "category": "Lymphatic Health & Recovery",
+        "mechanism": "Micro-Massage Technology",
+        "facts": [
+            {
+                "statement": "Textured 'Micro-Massage' fabrics (like MicroPerle) stimulate superficial initial lymphatics, mimicking Manual Lymph Drainage (MLD).",
+                "citation": "Bioflect / Elastique Clinical Study (Thermal Imaging).",
+                "confidence": "Proprietary/Clinical"
+            },
+            {
+                "statement": "Alternating compressive and decompressive forces improve skin elasticity and drainage in lipedema patients.",
+                "citation": "MDPI: Pilot Study on Micro-Massage Compression in Lipedema.",
+                "confidence": "High"
+            }
+        ],
+        "recommended_collection": "MicroPerle (Iconic) Collection"
+    }
+]

@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+requests
+spacy
+google-generativeai
+# Optional: OpenAI for TTS
+openai

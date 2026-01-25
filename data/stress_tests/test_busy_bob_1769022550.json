@@ -1,0 +1,41 @@
+{
+  "persona": "Busy Bob",
+  "session_id": "test_busy_bob_1769022550",
+  "transcript": [
+    {
+      "step": 1,
+      "user": "Just show me the leggings.",
+      "bot": "I'd love to help you with that! To make sure I give you the most accurate routine and save your progress, could you just share your **First Name and Email Address**? Then we can dive right into the details.",
+      "grade": {
+        "score": 4,
+        "reasons": [
+          "+Identity Gate Pushed",
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 2,
+      "user": "Bob. bob@busy.com. Ankles are huge.",
+      "bot": "Thanks Bob! I've saved your profile. Now, **tell me a bit about what's going on in your body today?** (e.g., are you dealing with swelling, recovering from surgery, or just looking for general wellness?)",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Depth of Education"
+        ]
+      }
+    },
+    {
+      "step": 3,
+      "user": "Okay, what else?",
+      "bot": "Hi there! I'm Sarah. To give you the best recommendation, tell me a bit about what's going on.\n\nAre you managing **daily swelling/heaviness**, recovering from **surgery**, or looking for **general wellness**?",
+      "grade": {
+        "score": 2,
+        "reasons": [
+          "+Depth of Education"
+        ]
+      }
+    }
+  ],
+  "overall_score": 2.6666666666666665
+}
