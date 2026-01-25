@@ -95,11 +95,26 @@ tts_service = TextToSpeechService()
 # Initialize Conversation Manager with dependencies
 conv_manager = ConversationManager(citation_engine, analytics_service, mm_service)
 
+# [NEW] Brain Graph V2 Integration (Feature Flag)
+USE_BRAIN_GRAPH = os.getenv("USE_BRAIN_GRAPH", "false").lower() == "true"
+brain_graph = None
+
+if USE_BRAIN_GRAPH:
+    try:
+        from services.brain.graph import brain_graph
+        from langchain_core.messages import HumanMessage
+        logger.info("Brain Graph V2 ENABLED.")
+    except ImportError as e:
+        logger.warning(f"Brain Graph import failed: {e}. Falling back to legacy.")
+        USE_BRAIN_GRAPH = False
+else:
+    logger.info("Brain Graph V2 DISABLED (Legacy Mode).")
+
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """
     Main Chat Endpoint.
-    Uses ConversationManager State Machine.
+    Uses Brain Graph V2 if enabled, otherwise falls back to legacy ConversationManager.
     Returns Text + Audio (Base64).
     """
     user_msg = request.message
@@ -109,25 +124,61 @@ async def chat_endpoint(request: ChatRequest):
     # Use session_id if provided, else use email or default
     session_id = request.session_id or incoming_email or "default_session"
     
-    # 1. Identity Check (Stub - logic is inside process_turn mostly, or middleware)
+    response_text = ""
+    user_name_resolved = None
+    user_email_resolved = None
+
+    # --- Brain Graph V2 Path ---
+    if USE_BRAIN_GRAPH and brain_graph:
+        try:
+            from langchain_core.messages import HumanMessage
+            from services.brain.schemas import AgentState, UserProfile, ConversationContext
+            
+            # Build initial state
+            initial_state: AgentState = {
+                "messages": [HumanMessage(content=user_msg)],
+                "user_profile": UserProfile(email=incoming_email),
+                "context": ConversationContext(),
+                "next_node": None,
+                "error": None
+            }
+            
+            # Invoke Graph
+            final_state = brain_graph.invoke(initial_state)
+            
+            # Extract Response
+            last_message = final_state.get("messages", [])[-1]
+            response_text = last_message.content if hasattr(last_message, "content") else str(last_message)
+            
+            # User identity might have been updated by graph workers (future)
+            # For now, just pass through what we have
+            user_email_resolved = incoming_email
+            
+        except Exception as e:
+            logger.error(f"Brain Graph Error: {e}. Falling back to legacy.")
+            # Fallback to legacy
+            response_text = await conv_manager.process_turn(session_id, user_msg, incoming_email)
+            state = conv_manager.get_state(session_id)
+            user_email_resolved = state.user_email
+            user_name_resolved = state.user_name
     
-    # 2. Process Turn via State Machine
-    response_text = await conv_manager.process_turn(session_id, user_msg, incoming_email)
+    # --- Legacy Path ---
+    else:
+        response_text = await conv_manager.process_turn(session_id, user_msg, incoming_email)
+        state = conv_manager.get_state(session_id)
+        user_email_resolved = state.user_email
+        user_name_resolved = state.user_name
     
     # 3. Generate Audio (Async - Optional but Premium)
     audio_base64 = None
     if tts_service:
-        # Check if we should use French Accent (Hack)
-        # We can pass context later, for now defaults to Sarah (Journey-F)
         audio_base64 = await tts_service.generate_audio(response_text)
     
-    # [NEW] Return Identity Metadata for Frontend Persistence
-    state = conv_manager.get_state(session_id)
     return {
         "response": response_text, 
         "audio": audio_base64,
-        "user_email": state.user_email,
-        "user_name": state.user_name
+        "user_email": user_email_resolved,
+        "user_name": user_name_resolved
     }
 
 @app.post("/upload")
