@@ -14,6 +14,8 @@ from services.schemas import UserSessionState
 from services.redaction import redact_phi
 from services.research_library import ResearchLibrary
 from services.response_interpreter import ResponseInterpreter
+from services.decision_router import DecisionRouter
+from services.protocol_generator import ProtocolGenerator
 import logging
 
 # --- Global NLP Config ---
@@ -25,6 +27,7 @@ except Exception:
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 TITLE_PREFIXES = {"mr", "mrs", "ms", "dr", "prof", "sir", "madam"}
 INVALID_NAME_TOKENS = {"yes", "no", "sure", "ok", "okay", "hello", "hi", "hey", "yo", "is", "name"}
+INVALID_NAME_VERBS = {"having", "feeling", "experiencing", "dealing", "getting", "hurting", "swelling", "pain", "aches", "aching"}
 
 def _strip_title(name: str) -> str:
     parts = [p for p in re.split(r"\s+", name.strip()) if p]
@@ -44,7 +47,7 @@ def extract_name(text: str) -> str:
     match = re.search(r"(?:name is|i am|i'm|im|call me|it's|its|this is|name[:\s]+)\s+([A-Z][a-zA-Z'-]+)", text, re.IGNORECASE)
     if match:
         name = _strip_title(match.group(1))
-        if name and name.lower() not in INVALID_NAME_TOKENS:
+        if name and name.lower() not in INVALID_NAME_TOKENS and name.lower() not in INVALID_NAME_VERBS:
             return name
 
     # 2. spaCy NER (if available)
@@ -54,7 +57,7 @@ def extract_name(text: str) -> str:
             for ent in doc.ents:
                 if ent.label_ == "PERSON":
                     name = _strip_title(ent.text)
-                    if name and name.lower() not in INVALID_NAME_TOKENS:
+                    if name and name.lower() not in INVALID_NAME_TOKENS and name.lower() not in INVALID_NAME_VERBS:
                         return name
         except Exception:
             pass
@@ -63,7 +66,7 @@ def extract_name(text: str) -> str:
     words = [w.strip(".,!?;") for w in text.strip().split() if w.strip(".,!?;")]
     if len(words) <= 2:
         candidate = _strip_title(words[0])
-        if candidate and candidate.lower() not in INVALID_NAME_TOKENS:
+        if candidate and candidate.lower() not in INVALID_NAME_TOKENS and candidate.lower() not in INVALID_NAME_VERBS:
             return candidate
     return None
 
@@ -416,6 +419,8 @@ class ConversationManager:
         self.llm_rewriter = llm_rewriter
         self.research_library = research_library or ResearchLibrary()
         self.response_interpreter = response_interpreter or ResponseInterpreter()
+        self.decision_router = DecisionRouter()
+        self.protocol_gen = ProtocolGenerator()
         self.states = {} 
 
     def get_state(self, session_id: str) -> UserSessionState:
@@ -559,15 +564,11 @@ class ConversationManager:
                 if self.crm:
                     self.crm.create_or_update_contact(email=email_part, first_name=name_part)
                 
-                # [FAST TRACK] Check if they also provided a symptom
-                # Reuse the keyword check from Soft Pivot logic
-                is_diagnosis_keyword = any(w in user_msg.lower() for w in ["swelling", "ankle", "leg", "surgery", "post-op", "lipo", "recovery", "protocol", "product", "leggings", "hurt", "pain"])
-                
+                # If they already described symptoms, go straight to discovery without jumping into protocol
+                is_diagnosis_keyword = any(w in user_msg.lower() for w in ["swelling", "ankle", "leg", "surgery", "post op", "post-op", "lipo", "recovery", "protocol", "product", "leggings", "hurt", "pain"])
                 if is_diagnosis_keyword:
-                    # Delegate immediately to diagnosis logic
-                    diagnosis_response = self._handle_diagnosis_v3(session_id, user_msg)
-                    # Prepend confirmation
-                    response = f"Thanks {name_part}! I've saved your profile. {diagnosis_response}"
+                    self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                    response = f"Thanks {name_part}! I've saved your profile. {self._handle_discovery(session_id, user_msg)}"
                     return await self._finalize_response(session_id, user_msg, response)
 
                 response = (f"Thanks {name_part}! I've saved your profile. "
@@ -642,6 +643,11 @@ class ConversationManager:
                 return await self._finalize_response(session_id, user_msg, response)
             goal = detect_goal(user_msg)
             if not goal:
+                symptom_keywords = ["swelling", "swollen", "ankle", "leg", "legs", "pain", "hurt", "ache", "aching", "heavy", "edema", "puffy", "cankle"]
+                if any(w in msg_lower for w in symptom_keywords):
+                    self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                    response = self._handle_discovery(session_id, user_msg)
+                    return await self._finalize_response(session_id, user_msg, response)
                 if _is_uncertain(user_msg):
                     self.update_state(session_id, {"pending_goal_default": True})
                     response = "No problem. Most people start with a lymphatic wellness protocol. Does that sound right?"
@@ -810,7 +816,7 @@ class ConversationManager:
                             "(like deep breathing) to create the pressure changes that move fluid.")
 
         summary = _build_user_summary(state)
-        if summary:
+        if summary and not state.extra_context:
             bridge = f"\n\n{summary} If I missed anything, tell me."
         bridge += bridge_core
 
@@ -872,13 +878,19 @@ class ConversationManager:
             prescription.append(f"[Show Me]({product['url']})")
 
         # --- F. Closing ---
-        closing = "\n\nDoes this routine feel manageable for you to start including this evening?"
+        closing = "\n\nDoes this routine feel manageable, or would you like any changes or questions before we finalize it?"
         
         # Combine
         full_response = intro + bridge + "".join(prescription) + closing
         
         # Update State
-        self.update_state(session_id, {"stage": "agreement", "agreed_protocol": [selected_protocol['title']]})
+        protocol_items = []
+        for item in selected_protocol.get("items", []):
+            action = item.get("name")
+            details = item.get("dose") or item.get("instruction")
+            if action and details:
+                protocol_items.append({"action": action, "details": details})
+        self.update_state(session_id, {"stage": "agreement", "agreed_protocol": [selected_protocol['title']], "protocol_items": protocol_items})
         
         return full_response
 
@@ -893,6 +905,9 @@ class ConversationManager:
         llm_interpreted = self.response_interpreter.interpret(msg) if self.response_interpreter else {}
         llm_conf = (llm_interpreted or {}).get("confidence", "low")
         llm_ok = llm_conf in ("medium", "high")
+        router_interpreted = self.decision_router.interpret_discovery(msg) if self.decision_router else {}
+        router_conf = (router_interpreted or {}).get("confidence", "low")
+        router_ok = router_conf in ("medium", "high")
 
         # Last chance confirmation flow before protocol
         if state.pending_summary_details:
@@ -924,6 +939,8 @@ class ConversationManager:
         # Update discovery fields if missing
         if not state.primary_region:
             region = interpreted.get("region") or extract_primary_region(msg_lower)
+            if router_ok and (not region or region == "unknown"):
+                region = router_interpreted.get("region")
             if llm_ok and (not region or region == "unknown"):
                 region = llm_interpreted.get("region")
             if region and region != "unknown":
@@ -932,6 +949,8 @@ class ConversationManager:
 
         if not state.context_trigger:
             context = interpreted.get("context") or extract_context_trigger(msg_lower)
+            if router_ok and (not context or context == "unknown"):
+                context = router_interpreted.get("context")
             if llm_ok and (not context or context == "unknown"):
                 context = llm_interpreted.get("context")
             if context and context != "unknown":
@@ -954,6 +973,8 @@ class ConversationManager:
 
         if state.context_trigger and not state.timing:
             timing = interpreted.get("timing") or extract_timing(msg_lower)
+            if router_ok and (not timing or timing == "unknown"):
+                timing = router_interpreted.get("timing")
             if llm_ok and (not timing or timing == "unknown"):
                 timing = llm_interpreted.get("timing")
             if timing and timing != "unknown":
@@ -961,6 +982,9 @@ class ConversationManager:
                 state = self.get_state(session_id)
 
         # Capture constraints early if present
+        if router_ok and router_interpreted.get("constraints") and not state.extra_context:
+            self.update_state(session_id, {"extra_context": router_interpreted.get("constraints")})
+            state = self.get_state(session_id)
         if llm_ok and llm_interpreted.get("constraints") and not state.extra_context:
             self.update_state(session_id, {"extra_context": llm_interpreted.get("constraints")})
             state = self.get_state(session_id)
@@ -1054,23 +1078,61 @@ class ConversationManager:
             "yes", "sure", "ok", "okay", "great", "sounds good", "please",
             "protocol", "routine", "generate", "pdf", "send"
         ]
+        router = self.decision_router.interpret_agreement(msg) if self.decision_router else {}
+        router_conf = (router or {}).get("confidence", "low")
+        router_decision = (router or {}).get("decision")
+        router_constraints = (router or {}).get("constraints")
+
+        if router_conf in ("medium", "high") and router_constraints:
+            self.update_state(session_id, {"extra_context": router_constraints})
+
+        if router_conf in ("medium", "high") and router_decision in ("modify", "unsure", "question", "decline"):
+            self.update_state(session_id, {"refinement_count": self.get_state(session_id).refinement_count + 1})
+            if router_decision == "question":
+                return ("Great question. What part would you like clarified or adjusted so it feels realistic for you?")
+            return ("Understood. What would you like to adjust in the routine, intensity, or timing? "
+                    "I can tailor it to fit your day.")
+
         if any(w in msg_lower for w in affirmative_keywords):
+            state = self.get_state(session_id)
+            protocol_items = state.protocol_items or []
+            title = state.agreed_protocol[0] if state.agreed_protocol else "Your Lymphatic Wellness Focus"
+            user_name = state.user_name or "Valued Client"
+            pdf_path = None
+            try:
+                pdf_path = self.protocol_gen.generate_pdf(
+                    conversation_id=session_id,
+                    user_name=user_name,
+                    root_cause=title,
+                    daily_items=protocol_items,
+                    weekly_items=[],
+                    email=state.user_email
+                )
+            except Exception:
+                pdf_path = None
+            pdf_url = None
+            if pdf_path:
+                filename = os.path.basename(pdf_path)
+                pdf_url = f"/static/protocols/{filename}"
             self.update_state(session_id, {"stage": "fork"})
-            return ("Fantastic. I'm generating your **Personalized Wellness Protocol** PDF right now.\n\n"
-                    "While that processes, would you like to see the **Clinical Garments** that support this protocol, "
-                    "or speak to a **Specialist**?")
+            if pdf_url:
+                return ("Fantastic. Your personalized protocol PDF is ready.\n\n"
+                        f"[Download your protocol]({pdf_url})\n\n"
+                        "Would you like to see **Clinical Garments** that support this protocol or schedule a **Consultation**?")
+            return ("Fantastic. I am preparing your personalized protocol now.\n\n"
+                    "Would you like to see **Clinical Garments** that support this protocol or schedule a **Consultation**?")
         
-        # [FIX] Handle objections/difficulty without looping
-        elif any(w in msg_lower for w in ["no", "can't", "cant", "hard", "difficult"]):
-            self.update_state(session_id, {"stage": "fork"})
-            return ("Understood. We can modify the intensity. I've noted to start with a gentler pace in your full protocol.\n\n"
-                    "While I finalize that, would you prefer to look at **Clothing** options or a **Consultation**?")
+        # Handle objections or modification requests and stay in agreement
+        if any(w in msg_lower for w in ["no", "cant", "can't", "hard", "difficult", "change", "modify", "adjust", "too much", "too hard", "too long", "not sure", "unsure"]):
+            self.update_state(session_id, {"refinement_count": self.get_state(session_id).refinement_count + 1})
+            return ("Understood. What would you like to adjust in the routine, intensity, or timing? "
+                    "I can tailor it to fit your day.")
         
-        else:
-            # Fallback that tries to nudge forward
-            self.update_state(session_id, {"stage": "fork"})
-            return ("I hear you. Let's aim for the 'Foundation' level first.\n\n"
-                    "I'm generating your full plan now. While that runs, do you want to browse **Compression Wear** or talk to a **Specialist**?")
+        if "?" in msg:
+            return ("Great question. What part would you like clarified or adjusted so it feels realistic for you?")
+
+        # Fallback keeps the agreement loop
+        return ("Thanks for sharing. What would make this routine feel doable for you so we can lock it in?")
 
     def _handle_fork(self, session_id, msg):
         return "Would you prefer to look at **Clothing** options or a **Consultation**?"
