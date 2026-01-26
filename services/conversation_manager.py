@@ -1,38 +1,405 @@
 from typing import Dict, List, Optional
+import os
 import random
 import re
-import spacy
+try:
+    import spacy
+except Exception:
+    spacy = None
 from services.clinical_library import CLINICAL_PROTOCOLS 
 from services.product_catalog import PRODUCT_CATALOG 
 from services.crm_service import CRMService 
 from services.safety_service import SafetyService
 from services.schemas import UserSessionState
+from services.redaction import redact_phi
+from services.research_library import ResearchLibrary
+from services.response_interpreter import ResponseInterpreter
 import logging
 
 # --- Global NLP Config ---
 try:
-    nlp = spacy.load("en_core_web_sm")
-except:
+    nlp = spacy.load("en_core_web_sm") if spacy else None
+except Exception:
     nlp = None
 
-def extract_name(text):
+EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+TITLE_PREFIXES = {"mr", "mrs", "ms", "dr", "prof", "sir", "madam"}
+INVALID_NAME_TOKENS = {"yes", "no", "sure", "ok", "okay", "hello", "hi", "hey", "yo", "is", "name"}
+
+def _strip_title(name: str) -> str:
+    parts = [p for p in re.split(r"\s+", name.strip()) if p]
+    if not parts:
+        return ""
+    first = parts[0].lower().strip(".,")
+    if first in TITLE_PREFIXES and len(parts) > 1:
+        parts = parts[1:]
+    return parts[0].strip(".,") if parts else ""
+
+def extract_name(text: str) -> str:
     """
-    Extracts the first PERSON entity from a string using spaCy.
-    Handles 'Call me Jim', 'I am Jim', etc.
+    Extracts a first name from a string.
+    Supports: "Call me Jim", "I am Jim", "Name: Jim", "Jim jim@email.com".
     """
     # 1. Regex Pattern Matching (Priority)
-    # Support CamelCase or simple names (e.g. BugFixUser, Jim)
-    match = re.search(r"(?:name is|I am|I'm|Im|call me|it's|its|this is)\s+([A-Z][a-zA-Z]+)", text, re.IGNORECASE)
+    match = re.search(r"(?:name is|i am|i'm|im|call me|it's|its|this is|name[:\s]+)\s+([A-Z][a-zA-Z'-]+)", text, re.IGNORECASE)
     if match:
-        return match.group(1)
+        name = _strip_title(match.group(1))
+        if name and name.lower() not in INVALID_NAME_TOKENS:
+            return name
 
-    if not nlp:
-        # 2. Short Message Heuristic (Fallback)
-        words = text.strip().split()
-        if len(words) <= 2:
-             return words[-1].strip(".,!?;")
+    # 2. spaCy NER (if available)
+    if nlp:
+        try:
+            doc = nlp(text)
+            for ent in doc.ents:
+                if ent.label_ == "PERSON":
+                    name = _strip_title(ent.text)
+                    if name and name.lower() not in INVALID_NAME_TOKENS:
+                        return name
+        except Exception:
+            pass
+
+    # 3. Fallback: short message heuristic
+    words = [w.strip(".,!?;") for w in text.strip().split() if w.strip(".,!?;")]
+    if len(words) <= 2:
+        candidate = _strip_title(words[0])
+        if candidate and candidate.lower() not in INVALID_NAME_TOKENS:
+            return candidate
+    return None
+
+def is_valid_email(email: str) -> bool:
+    return bool(email and EMAIL_REGEX.fullmatch(email))
+
+def redact_emails(text: str) -> str:
+    if not text:
+        return text
+    return EMAIL_REGEX.sub("[EMAIL]", text)
+
+def parse_identity(text: str) -> Dict[str, Optional[str]]:
+    """
+    Attempts to extract both name and email from a single message.
+    """
+    email_match = EMAIL_REGEX.search(text)
+    email = email_match.group(0) if email_match else None
+
+    name = extract_name(text)
+    if name and name.lower() in INVALID_NAME_TOKENS:
+        name = None
+
+    # If the extracted name looks like part of the email local name, try a better name
+    local_part = email.split("@")[0].lower() if email else None
+    if email and name:
+        if local_part and name.lower() in local_part:
+            name = None
+
+    # If name wasn't found but we have "Name: X" style
+    if not name:
+        name_match = re.search(r"name[:\s]+([A-Z][a-zA-Z'-]+)", text, re.IGNORECASE)
+        if name_match:
+            candidate = _strip_title(name_match.group(1))
+            if candidate and candidate.lower() not in INVALID_NAME_TOKENS:
+                if not local_part or candidate.lower() not in local_part:
+                    name = candidate
+
+    # If still missing, try token before email (e.g., "Jessica jessica@test.com")
+    if email and not name:
+        tokens = text.split()
+        for i, tok in enumerate(tokens):
+            if email in tok and i > 0:
+                candidate = _strip_title(tokens[i - 1])
+                if candidate and candidate.lower() not in INVALID_NAME_TOKENS:
+                    name = candidate
+                break
+
+    # If still missing, try token after email (e.g., "name is x@email.com Chris")
+    if email and not name:
+        tokens = [t.strip(".,!?;") for t in text.split()]
+        for i, tok in enumerate(tokens):
+            if email in tok and i + 1 < len(tokens):
+                candidate = _strip_title(tokens[i + 1])
+                if candidate and candidate.isalpha() and candidate.lower() not in INVALID_NAME_TOKENS:
+                    name = candidate
+                break
+
+    # If still missing, use first reasonable word as name (e.g., "Mike here, mike@test.com")
+    if email and not name:
+        for tok in text.split():
+            candidate = _strip_title(tok)
+            if candidate and candidate.isalpha() and candidate.lower() not in INVALID_NAME_TOKENS:
+                name = candidate
+                break
+
+    return {"name": name, "email": email}
+
+def detect_goal(text: str) -> Optional[str]:
+    if not text:
         return None
+    t = text.lower()
+    if any(k in t for k in ["consult", "consultation", "specialist", "1:1", "one-on-one", "schedule", "appointment"]):
+        return "consult"
+    if any(k in t for k in ["shop", "buy", "purchase", "products", "leggings", "bra", "tank", "clothing"]):
+        return "shop"
+    if any(k in t for k in ["protocol", "routine", "help", "support", "wellness", "swelling", "pain", "recovery"]):
+        return "protocol"
+    return None
 
+def extract_primary_region(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = text.lower()
+    if any(w in t for w in ["all over", "everywhere", "whole body", "entire body", "general", "overall", "full body"]):
+        return "general"
+    if any(w in t for w in ["surgery", "post-op", "lipo", "recovery"]):
+        return "post_op"
+    if any(w in t for w in ["leg", "legs", "lower body", "ankle", "instep", "shin", "shins", "foot", "feet", "calf", "calves", "cankle", "knee", "thigh", "hip", "hips", "glute", "glutes", "butt"]):
+        return "legs"
+    if any(w in t for w in ["arm", "arms", "hand", "hands", "finger", "fingers", "elbow", "shoulder", "wrist", "wrists", "forearm", "forearms", "bicep", "biceps", "tricep", "triceps"]):
+        return "arms"
+    if any(w in t for w in ["neck", "face", "jaw", "jawline", "cheek", "cheeks", "collarbone", "head", "migraine", "fog"]):
+        return "neck"
+    if any(w in t for w in ["abdomen", "belly", "stomach", "lower belly", "bloat", "bloating", "core", "torso", "trunk", "chest", "back", "lower back", "upper back", "midsection", "midriff", "waist", "side waist", "rib", "ribs", "ribcage", "sternum"]):
+        return "core"
+    return None
+
+def extract_context_trigger(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = text.lower()
+    if any(w in t for w in ["surgery", "post op", "post-op", "lipo", "bbl", "tummy tuck", "recovery", "procedure", "operation", "c section", "cesarean"]):
+        return "post_op"
+    if any(w in t for w in ["flight", "flying", "plane", "air travel", "travel", "trip", "road trip", "car", "drive", "long drive"]):
+        return "travel"
+    if any(w in t for w in ["heat", "heat wave", "hot", "summer", "humidity", "humid"]):
+        return "heat"
+    if any(w in t for w in ["workout", "training", "gym", "session", "run", "running", "marathon", "race", "tennis", "golf", "spin", "cycle", "cycling", "pilates", "yoga", "hot yoga", "dance", "hike", "hiking"]):
+        return "workout"
+    if any(w in t for w in ["pregnant", "pregnancy", "maternity"]):
+        return "pregnancy"
+    if any(w in t for w in ["daily", "every day", "all day", "always", "all the time", "ongoing", "standing", "sitting", "desk", "work", "job", "long day", "long shift", "after work", "after a long day"]):
+        return "daily"
+    return None
+
+def extract_timing(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = text.lower()
+    if any(w in t for w in ["i dont know", "i don't know", "idk", "not sure", "unsure", "no idea", "unknown"]):
+        return "variable"
+    if any(w in t for w in ["all day", "all day long", "all the time", "anytime", "off and on", "throughout", "all of them", "doesnt matter", "doesn't matter", "no difference", "same", "the same", "always", "daily", "every day", "constant", "24 7", "24-7", "24/7"]):
+        return "all_day"
+    if any(w in t for w in ["morning", "am", "wake up", "waking", "first thing"]):
+        return "morning"
+    if any(w in t for w in ["afternoon", "midday", "lunch", "after lunch"]):
+        return "afternoon"
+    if any(w in t for w in ["evening", "night", "pm", "late in the day", "end of day", "after dinner", "sunset", "bedtime", "after work"]):
+        return "evening"
+    return None
+
+def _region_keywords(region: Optional[str]) -> list:
+    if region == "post_op":
+        return ["post-op", "surgery", "lipo"]
+    if region == "legs":
+        return ["legs", "ankles", "feet"]
+    if region == "arms":
+        return ["arms", "hands"]
+    if region == "neck":
+        return ["neck", "face", "jaw"]
+    if region == "core":
+        return ["abdomen", "bloating"]
+    if region == "general":
+        return []
+    return []
+
+def _context_keywords(context: Optional[str]) -> list:
+    if context == "post_op":
+        return ["post-op", "surgery", "recovery"]
+    if context == "travel":
+        return ["travel", "flight", "plane"]
+    if context == "heat":
+        return ["heat", "hot", "summer"]
+    if context == "workout":
+        return ["workout", "training", "run"]
+    if context == "pregnancy":
+        return ["pregnant", "pregnancy"]
+    if context == "daily":
+        return ["daily"]
+    return []
+
+def _is_uncertain(msg: str) -> bool:
+    t = (msg or "").lower()
+    return any(w in t for w in ["i dont know", "i don't know", "idk", "not sure", "unsure", "no idea", "maybe"])
+
+def _interpret_discovery(msg: str) -> Dict[str, Optional[str]]:
+    """
+    Holistic interpretation of a reply to infer region, trigger, and timing.
+    Returns dict with inferred slots and uncertainty flags.
+    """
+    t = (msg or "").lower()
+    info = {
+        "region": None,
+        "context": None,
+        "timing": None,
+        "uncertain_region": False,
+        "uncertain_context": False,
+        "uncertain_timing": False,
+    }
+    if _is_uncertain(t):
+        info["uncertain_region"] = True
+        info["uncertain_context"] = True
+        info["uncertain_timing"] = True
+
+    # Region inference
+    region_hits = set()
+    if any(w in t for w in ["leg", "legs", "lower body", "ankle", "instep", "shin", "shins", "foot", "feet", "calf", "calves", "cankle", "knee", "thigh", "hip", "hips", "glute", "glutes", "butt"]):
+        region_hits.add("legs")
+    if any(w in t for w in ["arm", "arms", "hand", "hands", "finger", "fingers", "elbow", "shoulder", "wrist", "wrists", "forearm", "forearms", "bicep", "biceps", "tricep", "triceps"]):
+        region_hits.add("arms")
+    if any(w in t for w in ["neck", "face", "jaw", "jawline", "cheek", "cheeks", "collarbone", "head", "migraine", "fog"]):
+        region_hits.add("neck")
+    if any(w in t for w in ["abdomen", "belly", "lower belly", "stomach", "bloat", "bloating", "core", "torso", "trunk", "chest", "back", "lower back", "upper back", "midsection", "midriff", "waist", "side waist", "rib", "ribs", "ribcage", "sternum"]):
+        region_hits.add("core")
+    if any(w in t for w in ["all over", "everywhere", "whole body", "entire body", "general", "overall", "full body"]):
+        region_hits.add("general")
+
+    if len(region_hits) == 1:
+        info["region"] = list(region_hits)[0]
+    elif len(region_hits) > 1:
+        info["region"] = "general"
+    else:
+        region = extract_primary_region(t)
+        if region:
+            info["region"] = region
+
+    # Context inference
+    context = extract_context_trigger(t)
+    if context:
+        info["context"] = context
+    elif any(w in t for w in ["accident", "injury", "hurt", "trauma"]):
+        info["context"] = "daily"
+
+    # Timing inference
+    timing = extract_timing(t)
+    if timing:
+        info["timing"] = timing
+
+    if any(w in t for w in ["comes and goes", "on and off", "off and on", "fluctuates", "varies", "random", "no pattern", "whenever"]):
+        info["timing"] = "variable"
+    if any(w in t for w in ["constant", "always", "all the time", "all day", "all day long", "24/7", "24 7", "24-7"]):
+        info["timing"] = "all_day"
+    if any(w in t for w in ["worse at night", "end of day", "late in the day", "after work", "evening", "after a long day", "after long day", "after dinner", "sunset", "by bedtime"]):
+        info["timing"] = "evening"
+    if any(w in t for w in ["in the morning", "wake up", "when i wake", "morning", "first thing"]):
+        info["timing"] = "morning"
+    if any(w in t for w in ["midday", "afternoon", "lunch", "after lunch"]):
+        info["timing"] = "afternoon"
+
+    if info["timing"] in ("variable", "all_day"):
+        info["uncertain_timing"] = False
+
+    return info
+
+def _discovery_empathy(msg: str) -> str:
+    t = (msg or "").lower()
+    if any(w in t for w in ["pain", "hurt", "aching", "sore"]):
+        return "I’m sorry you’re dealing with that. It sounds really uncomfortable."
+    if any(w in t for w in ["swelling", "puffy", "heavy", "edema"]):
+        return "Thanks for sharing that. Swelling can feel frustrating and heavy."
+    if any(w in t for w in ["accident", "injury", "surgery", "post-op", "recovery"]):
+        return "I’m sorry that happened. Let’s make this as clear and supportive as possible."
+    if any(w in t for w in ["wellness", "prevent", "optimize", "performance", "training"]):
+        return "That’s a great goal. I can help tailor this to your routine."
+    return "Thanks for sharing. I want to make sure this is tailored to you."
+
+def _is_affirmative(msg: str) -> bool:
+    t = (msg or "").lower()
+    return any(w in t for w in ["yes", "yep", "yeah", "sure", "ok", "okay", "please", "go ahead", "sounds good"])
+
+def _is_negative(msg: str) -> bool:
+    t = (msg or "").lower()
+    return any(w in t for w in ["no", "not now", "don't", "do not", "prefer not", "skip"])
+
+def _is_email_check(msg: str) -> bool:
+    t = (msg or "").lower()
+    return "email" in t and any(w in t for w in ["what", "which", "have", "on file", "did you save"])
+
+def _is_repeat_frustration(msg: str) -> bool:
+    t = (msg or "").lower()
+    return any(w in t for w in ["already", "told you", "as i said", "above", "i said"])
+
+def _sanitize_no_dashes(text: str) -> str:
+    if not text:
+        return text
+    urls = {}
+    def _protect_url(match):
+        key = f"__URL{len(urls)}__"
+        urls[key] = match.group(0)
+        return key
+    text = re.sub(r"https?://\S+", _protect_url, text)
+    text = text.replace("—", ". ").replace("–", ". ")
+    text = text.replace(" - ", ". ")
+    text = re.sub(r"(\d)\s*-\s*(\d)", r"\1 to \2", text)
+    text = re.sub(r"(?<=\w)-(?=\w)", " ", text)
+    text = re.sub(r"[ ]{2,}", " ", text)
+    for key, url in urls.items():
+        text = text.replace(key, url)
+    return text
+
+def _build_user_summary(state: Optional[UserSessionState]) -> Optional[str]:
+    if not state:
+        return None
+    region_map = {
+        "legs": "your legs and feet",
+        "arms": "your arms and hands",
+        "neck": "your face and neck",
+        "core": "your abdomen and core",
+        "post_op": "post op recovery area",
+        "general": "multiple areas",
+    }
+    context_map = {
+        "post_op": "related to surgery or recovery",
+        "travel": "related to travel",
+        "heat": "related to heat or humidity",
+        "workout": "related to workouts",
+        "pregnancy": "related to pregnancy",
+        "daily": "more of a daily pattern",
+    }
+    timing_map = {
+        "morning": "worse in the morning",
+        "afternoon": "worse in the afternoon",
+        "evening": "worse in the evening",
+        "all_day": "present all day",
+        "variable": "on and off",
+    }
+
+    sentences = []
+    if state.primary_region and state.primary_region in region_map:
+        sentences.append(f"You mentioned {region_map[state.primary_region]}.")
+    if state.context_trigger and state.context_trigger in context_map:
+        sentences.append(f"It seems {context_map[state.context_trigger]}.")
+    if state.timing and state.timing in timing_map:
+        sentences.append(f"It is {timing_map[state.timing]}.")
+
+    if not sentences:
+        return None
+    summary = "Here is what I heard. " + " ".join(sentences)
+    return summary
+
+def _get_attempts(state: Optional[UserSessionState], key: str) -> int:
+    if not state or not state.question_attempts:
+        return 0
+    return int(state.question_attempts.get(key, 0))
+
+def _record_question(state: Optional[UserSessionState], key: str) -> Dict[str, object]:
+    attempts = {}
+    if state and state.question_attempts:
+        attempts = dict(state.question_attempts)
+    attempts[key] = int(attempts.get(key, 0)) + 1
+    return {"last_question_key": key, "question_attempts": attempts}
+
+def _clear_last_question(state: Optional[UserSessionState]) -> Dict[str, object]:
+    if not state:
+        return {"last_question_key": None}
+    return {"last_question_key": None}
 logger = logging.getLogger(__name__)
 
 class ConversationManager:
@@ -41,11 +408,14 @@ class ConversationManager:
     Refactored V3: Implements 'Empathy Sandwich' and 'Educational Bridging' per bot_training_manual.md.
     """
     
-    def __init__(self, citation_engine=None, analytics_service=None, mm_service=None):
+    def __init__(self, citation_engine=None, analytics_service=None, mm_service=None, llm_rewriter=None, research_library=None, response_interpreter=None):
         self.citation_engine = citation_engine
         self.analytics = analytics_service
         self.crm = CRMService()
         self.mm_service = mm_service # [NEW] Inject Multimodal Service for Smart ID
+        self.llm_rewriter = llm_rewriter
+        self.research_library = research_library or ResearchLibrary()
+        self.response_interpreter = response_interpreter or ResponseInterpreter()
         self.states = {} 
 
     def get_state(self, session_id: str) -> UserSessionState:
@@ -86,37 +456,41 @@ class ConversationManager:
             # Scenario 1: Active Session (Same Session ID)
             if state.user_name:
                 self.crm.log_interaction(session_id, "System", "Welcome Back trigger")
-                return f"Welcome back, {state.user_name}! I remember we were discussing your **{state.diagnosis or 'wellness goals'}**. How is it going?"
+                response = (f"Welcome back, {state.user_name}! "
+                            "What are you looking to accomplish today? "
+                            "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                return await self._finalize_response(session_id, user_msg, response)
             
             # Scenario 2: New Session + Known Email (Smart Retention)
-            if user_email:
-                # [NEW] Check CRM for History
-                last_active = self.crm.get_last_interaction(user_email)
-                
-                if last_active and last_active.get("user_name"):
-                    crm_name = last_active["user_name"]
+                if user_email:
+                    # [NEW] Check CRM for History
+                    last_active = self.crm.get_last_interaction(user_email)
+                    
+                    if last_active and last_active.get("user_name"):
+                        crm_name = last_active["user_name"]
                     
                     # Pre-fill State
-                    self.update_state(session_id, {
-                        "user_name": crm_name,
-                        "user_email": user_email,
-                        "stage": "diagnosis"
-                    })
+                        self.update_state(session_id, {
+                            "user_name": crm_name,
+                            "user_email": user_email,
+                            "stage": "goal_capture"
+                        })
 
-                    # Smart Context Greeting (Intent-Aware)
-                    intent = last_active.get("intent")
-                    last_stage = last_active.get("stage")
+                        # Smart Context Greeting (Intent-Aware)
+                        intent = last_active.get("intent")
+                        last_stage = last_active.get("stage")
 
-                    if intent:
-                        # [NEW] Check if they actually finished/agreed to it
-                        if last_stage in ["agreement", "complete", "protocol_delivered"]:
-                             return f"Welcome back, {crm_name}! Last time we were working on your **{intent}** protocol. How is that going today?"
-                        
-                        # Pending Protocol (Recommended but not Accepted)
-                        return f"Welcome back, {crm_name}! Are you here to continue discussing the protocol I recommended for **{intent}**?"
+                        if intent:
+                            response = (f"Welcome back, {crm_name}! Last time we were working on your **{intent}**. "
+                                        "What are you looking to accomplish today? "
+                                        "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                            return await self._finalize_response(session_id, user_msg, response)
                     
                     # No specific protocol yet? Ask generic but personalized.
-                    return f"Welcome back, {crm_name}! I see we haven't set up a full protocol yet. How can I help your body today?"
+                    response = (f"Welcome back, {crm_name}! "
+                                "What are you looking to accomplish today? "
+                                "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                    return await self._finalize_response(session_id, user_msg, response)
                 
                 # Known Email but NO Name in CRM? -> Identity Capture (Strict)
                 self.update_state(session_id, {"stage": "identity_capture", "user_email": user_email})
@@ -124,28 +498,43 @@ class ConversationManager:
             
             else:
                 self.update_state(session_id, {"stage": "identity_capture"})
-                return ("Hello! I'm **Sarah**, your Lymphatic Wellness Guide.\n\n"
-                        "To build your personalized protocol, I just need your **First Name** and **Email Address**.")
+                response = ("Hello! I'm **Sarah**, your Lymphatic Wellness Guide.\n\n"
+                        "To remember your needs and build your **personalized lymphatic wellness protocol**, "
+                        "I just need your **First Name** and a **valid Email Address**.")
+                return await self._finalize_response(session_id, user_msg, response)
 
         stage = state.stage
         
         # 1. Identity Capture Stage
         if stage == "identity_capture":
+            if _is_email_check(user_msg) and state.user_email:
+                response = (f"I have your email as **{state.user_email}**. "
+                            "What is your **first name** so I can save your profile?")
+                return await self._finalize_response(session_id, user_msg, response)
             # A. Check for Email (Strong Signal)
-            if "@" in user_msg:
-                email_part = next((w for w in user_msg.split() if "@" in w), user_msg)
+            identity = parse_identity(user_msg)
+            email_part = identity.get("email")
+
+            if email_part:
                 # [FIX] Strip trailing punctuation from email for Pydantic validation
                 email_part = email_part.rstrip(".,!?;")
+
+                # Validate Email
+                if not is_valid_email(email_part):
+                    return ("Thanks! That doesn't look like a valid email address. "
+                            "I need a **valid email** to remember your needs and build your **custom lymphatic wellness protocol**. "
+                            "What's the best email to use?")
                 
                 # [AI-POWERED] Smart Extraction
                 # Pre-fill with Regex result (Strong Signal)
-                regex_name = extract_name(user_msg)
+                regex_name = identity.get("name") or extract_name(user_msg)
                 
                 # Resolve Name: Extracted -> Temp State -> None (Strict Mode: No "Friend" default yet)
                 name_part = regex_name
-                if not name_part and self.mm_service:
+                redact_phi_enabled = os.getenv("REDACT_PHI", "true").lower() == "true"
+                if not name_part and self.mm_service and not redact_phi_enabled:
                     try:
-                        result = await self.mm_service.extract_identity(user_msg)
+                        result = await self.mm_service.extract_identity(redact_phi(user_msg))
                         name_part = result.get("name")
                     except:
                         pass
@@ -157,13 +546,16 @@ class ConversationManager:
                 if not name_part:
                     # We have Email, but NO Name. Prompt for Name.
                     self.update_state(session_id, {"user_email": email_part})
-                    return f"Thanks! I have your email as **{email_part}**. What is your **First Name** so I can build your profile?"
+                    response = (f"Thanks! I have your email as **{email_part}**. "
+                            "To remember your needs and build your **custom lymphatic wellness protocol**, "
+                            "what is your **First Name**?")
+                    return await self._finalize_response(session_id, user_msg, response)
 
                 email_extracted = email_part
                 
                 # We have BOTH Name and Email. Proceed.
                 # Persist
-                self.update_state(session_id, {"stage": "diagnosis", "user_email": email_part, "user_name": name_part})
+                self.update_state(session_id, {"stage": "goal_capture", "user_email": email_part, "user_name": name_part})
                 if self.crm:
                     self.crm.create_or_update_contact(email=email_part, first_name=name_part)
                 
@@ -175,16 +567,28 @@ class ConversationManager:
                     # Delegate immediately to diagnosis logic
                     diagnosis_response = self._handle_diagnosis_v3(session_id, user_msg)
                     # Prepend confirmation
-                    return f"Thanks {name_part}! I've saved your profile. {diagnosis_response}"
+                    response = f"Thanks {name_part}! I've saved your profile. {diagnosis_response}"
+                    return await self._finalize_response(session_id, user_msg, response)
 
-                return f"Thanks {name_part}! I've saved your profile. Now, **tell me a bit about what's going on in your body today?** (e.g., are you dealing with swelling, recovering from surgery, or just looking for general wellness?)"
+                response = (f"Thanks {name_part}! I've saved your profile. "
+                            "What are you looking to accomplish today? "
+                            "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                return await self._finalize_response(session_id, user_msg, response)
+
+            # If message contains '@' but no valid email match, prompt for a valid email
+            if "@" in user_msg:
+                response = ("Thanks! That doesn't look like a valid email address. "
+                        "I need a **valid email** to remember your needs and build your **custom lymphatic wellness protocol**. "
+                        "What's the best email to use?")
+                return await self._finalize_response(session_id, user_msg, response)
             
             # B. Soft Pivot for Interruption / Generic Greeting
             is_diagnosis_keyword = any(w in msg_lower for w in ["swelling", "ankle", "leg", "surgery", "post-op", "lipo", "recovery", "protocol", "product", "leggings"])
             
             if is_diagnosis_keyword:
-                return ("I'd love to help you with that! To make sure I give you the most accurate routine and save your progress, "
-                        "could you just share your **First Name and Email Address**? Then we can dive right into the details.")
+                response = ("I'd love to help you with that! To remember your needs and build your **custom lymphatic wellness protocol**, "
+                        "could you share your **First Name and a valid Email Address**? Then we can dive right into the details.")
+                return await self._finalize_response(session_id, user_msg, response)
 
             # C. Check for Name Only (Using spaCy NER + Robust Logic)
             parsed_name = extract_name(user_msg)
@@ -194,36 +598,113 @@ class ConversationManager:
                 # 1. Check if we already have their email (from previous turn)
                 if state.user_email:
                     # Success! We have both.
-                    self.update_state(session_id, {"stage": "diagnosis", "user_name": parsed_name})
+                    self.update_state(session_id, {"stage": "goal_capture", "user_name": parsed_name})
                     if self.crm:
                          self.crm.create_or_update_contact(email=state.user_email, first_name=parsed_name)
                     
-                    return f"Thanks {parsed_name}! I've saved your profile. Now, **tell me a bit about what's going on in your body today?**"
+                    response = (f"Thanks {parsed_name}! I've saved your profile. "
+                                "What are you looking to accomplish today? "
+                                "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                    return await self._finalize_response(session_id, user_msg, response)
 
                 # 2. No email yet? Save temp name and ask.
                 self.update_state(session_id, {"temp_name": parsed_name}) 
-                return f"Nice to meet you, {parsed_name}. **What is the best email address** for us to connect your wellness profile?"
+                response = (f"Nice to meet you, {parsed_name}. "
+                        "To remember your needs and build your **custom lymphatic wellness protocol**, "
+                        "what is the **best email address** to connect your profile?")
+                return await self._finalize_response(session_id, user_msg, response)
                 
             else:
-                return "Hello! I'm Sarah, your Lymphatic Wellness Guide. To get started, I just need your **First Name and Email Address** to build your profile."
+                response = ("Hello! I'm Sarah, your Lymphatic Wellness Guide. "
+                            "To remember your needs and build your **custom lymphatic wellness protocol**, "
+                            "I just need your **First Name and a valid Email Address**.")
+                return await self._finalize_response(session_id, user_msg, response)
 
         # 2. Main Diagnosis Logic (The V3 Core)
+        if stage == "goal_capture":
+            if state.pending_goal_default:
+                if _is_affirmative(user_msg):
+                    self.update_state(session_id, {"goal": "protocol", "stage": "discovery", "pending_goal_default": False})
+                    response = self._handle_discovery(session_id, user_msg)
+                    return await self._finalize_response(session_id, user_msg, response)
+                if _is_negative(user_msg):
+                    self.update_state(session_id, {"pending_goal_default": False})
+                else:
+                    return await self._finalize_response(
+                        session_id,
+                        user_msg,
+                        "No problem. Most people start with a lymphatic wellness protocol. Does that sound right?"
+                    )
+            if _is_email_check(user_msg) and state.user_email:
+                response = (f"I have your email as **{state.user_email}**. "
+                            "What are you looking to accomplish today? "
+                            "A lymphatic wellness protocol, shopping, or a 1:1 consult?")
+                return await self._finalize_response(session_id, user_msg, response)
+            goal = detect_goal(user_msg)
+            if not goal:
+                if _is_uncertain(user_msg):
+                    self.update_state(session_id, {"pending_goal_default": True})
+                    response = "No problem. Most people start with a lymphatic wellness protocol. Does that sound right?"
+                    return await self._finalize_response(session_id, user_msg, response)
+                response = ("What are you looking to accomplish today? "
+                            "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                return await self._finalize_response(session_id, user_msg, response)
+
+            self.update_state(session_id, {"goal": goal, "stage": "discovery"})
+
+            if goal == "consult":
+                response = ("Wonderful. To get you set up, may I have your **best phone number** "
+                            "for our specialist to call?")
+                return await self._finalize_response(session_id, user_msg, response)
+
+            # Protocol or Shopping intent flows into discovery
+            response = self._handle_discovery(session_id, user_msg)
+            return await self._finalize_response(session_id, user_msg, response)
+
+        if stage == "discovery":
+            response = self._handle_discovery(session_id, user_msg)
+            return await self._finalize_response(session_id, user_msg, response)
+
+        if stage == "consult":
+            response = ("Thank you. I’ve noted your number and a specialist will reach out shortly. "
+                        "Is there anything else you’d like help with today?")
+            return await self._finalize_response(session_id, user_msg, response)
+
         if stage == "diagnosis":
             # [Fail-safe] Late Email Capture
             if "@" in user_msg and not state.user_email:
-                 self.update_state(session_id, {"user_email": user_msg})
-                 if self.crm: self.crm.create_or_update_contact(email=user_msg, first_name=state.temp_name or "Friend")
-                 return "Got it! Now, tell me more—are you managing **daily swelling**, or is this specifically for **post-op recovery**?"
+                 identity = parse_identity(user_msg)
+                 email_part = identity.get("email")
+                 if email_part and is_valid_email(email_part):
+                     self.update_state(session_id, {"user_email": email_part})
+                     if self.crm: self.crm.create_or_update_contact(email=email_part, first_name=state.temp_name or "Friend")
+                     response = "Got it. Now, tell me more. Are you managing **daily swelling**, or is this specifically for **post op recovery**?"
+                     return await self._finalize_response(session_id, user_msg, response)
+                 response = ("Thanks! That doesn't look like a valid email address. "
+                         "I need a **valid email** to remember your needs and build your **custom lymphatic wellness protocol**. "
+                         "What's the best email to use?")
+                 return await self._finalize_response(session_id, user_msg, response)
 
-            return self._handle_diagnosis_v3(session_id, user_msg)
+            response = self._handle_diagnosis_v3(session_id, user_msg)
+            return await self._finalize_response(session_id, user_msg, response)
             
         elif stage == "agreement":
-            return self._handle_agreement(session_id, user_msg)
+            response = self._handle_agreement(session_id, user_msg)
+            return await self._finalize_response(session_id, user_msg, response)
             
         elif stage == "fork":
-            return self._handle_fork(session_id, user_msg)
+            response = self._handle_fork(session_id, user_msg)
+            return await self._finalize_response(session_id, user_msg, response)
             
-        return "I'm listening. Tell me more about what you're feeling in your body today."
+        response = "I'm listening. Tell me more about what you're feeling in your body today."
+        return await self._finalize_response(session_id, user_msg, response)
+
+    async def _finalize_response(self, session_id: str, user_msg: str, response: str) -> str:
+        if not self.llm_rewriter:
+            return _sanitize_no_dashes(response)
+        state = self.get_state(session_id)
+        rewritten = await self.llm_rewriter.rewrite(user_msg, response, state)
+        return _sanitize_no_dashes(rewritten)
 
     def _handle_diagnosis_v3(self, session_id, msg):
         """
@@ -239,7 +720,7 @@ class ConversationManager:
         
         # Detect Body Part / Issue
         issue_type = "foundation" # Default
-        if any(w in msg_lower for w in ["surgery", "post-op", "lipo", "recovery"]):
+        if any(w in msg_lower for w in ["surgery", "post-op", "post_op", "postop", "lipo", "recovery"]):
             issue_type = "post_op"
         elif any(w in msg_lower for w in ["leg", "ankle", "foot", "feet", "calf", "calves", "cankle"]):
             issue_type = "legs"
@@ -301,7 +782,7 @@ class ConversationManager:
             elif issue_type == "legs":
                 intro = "I hear you. Heavy legs at the end of the day are a classic sign that gravity is winning the battle against your circulation."
             elif issue_type == "post_op":
-                intro = "I understand completely. Post-op swelling is tricky because we want to move the fluid without disturbing the healing tissue."
+                intro = "I understand completely. Post op swelling is tricky because we want to move the fluid without disturbing the healing tissue."
             elif issue_type == "arms":
                 intro = "That heaviness in the arms can be frustrating. It often happens when the axillary (armpit) pathway is sluggish."
             else:
@@ -310,26 +791,41 @@ class ConversationManager:
 
         # --- C. Layer 2: Education (The Bridge) ---
         bridge = ""
+        bridge_core = ""
         if issue_type == "legs":
-            bridge = ("\n\n**Here is the underlying mechanics:**\n"
-                      "Your lymphatic system is unique because **it doesn't have a heart to pump it** like your blood does. "
-                      "It relies entirely on movement. When fluid pools in the ankles, it means the return flow is struggling against gravity.")
+            bridge_core = ("\n\n**Here is the underlying mechanics:**\n"
+                           "Your lymphatic system is unique because **it doesn't have a heart to pump it** like your blood does. "
+                           "It relies entirely on movement. When fluid pools in the ankles, it means the return flow is struggling against gravity.")
         elif issue_type == "post_op":
-            bridge = ("\n\n**Here is the goal:**\n"
-                      "Your body is currently in 'protection mode', holding onto fluid. Our goal is to gently open the 'drains' (near the collarbone) "
-                      "to create a vacuum effect, pulling that fluid away from the surgical site safely.")
+            bridge_core = ("\n\n**Here is the goal:**\n"
+                           "Your body is currently in 'protection mode', holding onto fluid. Our goal is to gently open the 'drains' (near the collarbone) "
+                           "to create a vacuum effect, pulling that fluid away from the surgical site safely.")
         elif issue_type == "arms":
-             bridge = ("\n\n**Here is what's happening:**\n"
-                       "The axillary (armpit) lymph nodes are the main drain for the arms. When they get congested or stagnant, "
-                       "fluid backs up into the hands and triceps. We need to clear the drain first.")
+             bridge_core = ("\n\n**Here is what's happening:**\n"
+                            "The axillary (armpit) lymph nodes are the main drain for the arms. When they get congested or stagnant, "
+                            "fluid backs up into the hands and triceps. We need to clear the drain first.")
         else:
-             bridge = ("\n\n**Here is the science:**\n"
-                       "The lymphatic system is your body's sewage treatment plant. Without a pump, it needs specific targeted movements "
-                       "(like deep breathing) to create the pressure changes that move fluid.")
+             bridge_core = ("\n\n**Here is the science:**\n"
+                            "The lymphatic system is your body's sewage treatment plant. Without a pump, it needs specific targeted movements "
+                            "(like deep breathing) to create the pressure changes that move fluid.")
+
+        summary = _build_user_summary(state)
+        if summary:
+            bridge = f"\n\n{summary} If I missed anything, tell me."
+        bridge += bridge_core
+
+        # [NEW] Micro-value insert (science-backed), if available
+        micro_value = None
+        if self.research_library:
+            region_hint = state.primary_region or (issue_type if issue_type in {"legs", "arms", "neck", "post_op", "core"} else None)
+            context_hint = state.context_trigger or extract_context_trigger(msg_lower)
+            micro_value = self.research_library.find_micro_value(msg_lower, region=region_hint, context=context_hint)
+        if micro_value:
+            bridge += f"\n\n**Science Snapshot:** {micro_value}"
 
         # --- D. Layer 3: Conversational Protocol (The Prescription) ---
         # Improved Formatting for readability
-        prescription = ["\n\n**Here is a Science-Backed Routine tailored for you:**"]
+        prescription = ["\n\n**Here is a Science Backed Routine tailored for you:**"]
         
         for item in selected_protocol['items']:
             # Create conversational linkage
@@ -359,6 +855,8 @@ class ConversationManager:
 
             # Evidence & Citations
             urls = item.get("urls", [])
+            if self.research_library:
+                urls = self.research_library.filter_valid_urls(urls)
             
             if urls:
                 footer = f"    _([Source]({urls[0]}))_"
@@ -384,9 +882,179 @@ class ConversationManager:
         
         return full_response
 
+    def _handle_discovery(self, session_id: str, msg: str) -> str:
+        """
+        One-question-per-turn discovery flow.
+        Collects goal-specific context before generating protocol.
+        """
+        state = self.get_state(session_id)
+        msg_lower = (msg or "").lower()
+        interpreted = _interpret_discovery(msg)
+        llm_interpreted = self.response_interpreter.interpret(msg) if self.response_interpreter else {}
+        llm_conf = (llm_interpreted or {}).get("confidence", "low")
+        llm_ok = llm_conf in ("medium", "high")
+
+        # Last chance confirmation flow before protocol
+        if state.pending_summary_details:
+            self.update_state(session_id, {"extra_context": msg, "pending_summary_details": False, "pending_summary_confirmation": False})
+            state = self.get_state(session_id)
+        elif state.pending_summary_confirmation:
+            if _is_negative(msg):
+                self.update_state(session_id, {"pending_summary_confirmation": False})
+                state = self.get_state(session_id)
+            elif _is_affirmative(msg) and len(msg.strip().split()) <= 3:
+                self.update_state(session_id, {"pending_summary_details": True})
+                return "Got it. What should I consider for your protocol?"
+            else:
+                self.update_state(session_id, {"extra_context": msg, "pending_summary_confirmation": False})
+                state = self.get_state(session_id)
+
+        # Resolve pending context default question
+        if state.pending_context_default:
+            if _is_affirmative(msg):
+                self.update_state(session_id, {"context_trigger": "daily", "pending_context_default": False})
+                state = self.get_state(session_id)
+            elif _is_negative(msg):
+                self.update_state(session_id, {"pending_context_default": False})
+                state = self.get_state(session_id)
+            else:
+                return ("No problem. If you are unsure, we can treat this as **daily** for now. "
+                        "Does that feel accurate?")
+
+        # Update discovery fields if missing
+        if not state.primary_region:
+            region = interpreted.get("region") or extract_primary_region(msg_lower)
+            if llm_ok and (not region or region == "unknown"):
+                region = llm_interpreted.get("region")
+            if region and region != "unknown":
+                self.update_state(session_id, {"primary_region": region, "last_question_key": None})
+                state = self.get_state(session_id)
+
+        if not state.context_trigger:
+            context = interpreted.get("context") or extract_context_trigger(msg_lower)
+            if llm_ok and (not context or context == "unknown"):
+                context = llm_interpreted.get("context")
+            if context and context != "unknown":
+                self.update_state(session_id, {"context_trigger": context, "last_question_key": None})
+                state = self.get_state(session_id)
+
+        # Permission gate (ask once before discovery questions)
+        if not state.discovery_permission_granted:
+            if not state.discovery_permission_asked:
+                self.update_state(session_id, {"discovery_permission_asked": True})
+                empathy = _discovery_empathy(msg)
+                return (f"{empathy}\n\n"
+                        "To build a **targeted lymphatic wellness guide**, would it be okay if I ask **4 to 5 quick questions**?")
+            # If user answered, handle yes/no
+            if _is_affirmative(msg):
+                self.update_state(session_id, {"discovery_permission_granted": True})
+            elif _is_negative(msg):
+                return ("No problem. When you’re ready, tell me the **main area** you want help with and your **primary goal**, "
+                        "and I’ll keep it brief.")
+
+        if state.context_trigger and not state.timing:
+            timing = interpreted.get("timing") or extract_timing(msg_lower)
+            if llm_ok and (not timing or timing == "unknown"):
+                timing = llm_interpreted.get("timing")
+            if timing and timing != "unknown":
+                self.update_state(session_id, {"timing": timing, "last_question_key": None})
+                state = self.get_state(session_id)
+
+        # Capture constraints early if present
+        if llm_ok and llm_interpreted.get("constraints") and not state.extra_context:
+            self.update_state(session_id, {"extra_context": llm_interpreted.get("constraints")})
+            state = self.get_state(session_id)
+
+        # If user provided context before explicit consent, treat it as implicit consent
+        if not state.discovery_permission_granted and state.discovery_permission_asked and (state.primary_region or state.context_trigger or state.timing):
+            self.update_state(session_id, {"discovery_permission_granted": True})
+
+        if not state.primary_region:
+            empathy = _discovery_empathy(msg)
+            attempts = _get_attempts(state, "region")
+            if _is_repeat_frustration(msg) and not interpreted.get("region"):
+                self.update_state(session_id, {"primary_region": "general", "last_question_key": None})
+                state = self.get_state(session_id)
+            elif attempts >= 2:
+                self.update_state(session_id, {"primary_region": "general", "last_question_key": None})
+                state = self.get_state(session_id)
+            else:
+                if attempts >= 1 or _is_repeat_frustration(msg) or interpreted.get("uncertain_region") or _is_uncertain(msg):
+                    question = ("If you already told me, I may have missed it. "
+                                "You can say **legs and feet**, **arms and hands**, **face and neck**, "
+                                "**abdomen and core**, or **multiple areas**.")
+                else:
+                    question = "Where in your body is the swelling or heaviness most noticeable?"
+                reason = "That helps me target the right lymphatic pathways."
+                self.update_state(session_id, _record_question(state, "region"))
+                return f"{empathy}\n\n{reason}\n\n{question}"
+
+        if not state.context_trigger:
+            empathy = _discovery_empathy(msg)
+            attempts = _get_attempts(state, "context")
+            if interpreted.get("uncertain_context") or _is_uncertain(msg):
+                if attempts >= 1:
+                    self.update_state(session_id, {"context_trigger": "daily", "pending_context_default": False, "last_question_key": None})
+                    state = self.get_state(session_id)
+                else:
+                    self.update_state(session_id, {"pending_context_default": True})
+                    self.update_state(session_id, _record_question(state, "context"))
+                    return ("No problem. If you are unsure, we can treat this as **daily** for now. "
+                            "Does that feel accurate?")
+            if not state.context_trigger:
+                if attempts >= 1:
+                    question = ("If none of these fit, you can say **daily** and we will keep it simple. "
+                                "Which sounds closest: **surgery**, **travel**, **workouts**, **heat**, **pregnancy**, "
+                                "or **daily**?")
+                else:
+                    question = ("Did this start after **surgery**, **travel**, **workouts**, **heat**, **pregnancy**, "
+                                "or is it more of a **daily** issue?")
+                reason = "The trigger changes which protocol is safest and most effective."
+                self.update_state(session_id, _record_question(state, "context"))
+                return f"{empathy}\n\n{reason}\n\n{question}"
+
+        if not state.timing:
+            empathy = _discovery_empathy(msg)
+            attempts = _get_attempts(state, "timing")
+            if attempts >= 2:
+                self.update_state(session_id, {"timing": "all_day", "last_question_key": None})
+                state = self.get_state(session_id)
+            else:
+                if attempts >= 1 or _is_repeat_frustration(msg) or interpreted.get("uncertain_timing") or _is_uncertain(msg):
+                    question = ("If it varies or feels constant, you can say **all day** or **on and off**. "
+                                "Otherwise, which is most true, **morning**, **afternoon**, or **evening**?")
+                else:
+                    question = "When does it feel worst, **morning**, **afternoon**, or **evening**?"
+                reason = "Timing helps me sequence your routine for the biggest relief."
+                self.update_state(session_id, _record_question(state, "timing"))
+                return f"{empathy}\n\n{reason}\n\n{question}"
+
+        # All required fields collected. Offer final confirmation once.
+        if state.primary_region and state.context_trigger and state.timing and not state.pending_summary_confirmation and not state.extra_context:
+            self.update_state(session_id, {"pending_summary_confirmation": True})
+            summary = _build_user_summary(state)
+            if summary:
+                return f"{summary} Before I build your protocol, is there anything you want me to consider like injuries, schedule, or constraints?"
+            return "Before I build your protocol, is there anything you want me to consider like injuries, schedule, or constraints?"
+
+        # All required fields collected -> generate protocol
+        keywords = []
+        keywords.extend(_region_keywords(state.primary_region))
+        keywords.extend(_context_keywords(state.context_trigger))
+        if state.timing:
+            keywords.append(state.timing)
+        if state.extra_context:
+            msg = f"{msg} {state.extra_context}"
+        synthetic_msg = f"{' '.join(keywords)} {msg}".strip()
+        return self._handle_diagnosis_v3(session_id, synthetic_msg)
+
     def _handle_agreement(self, session_id, msg):
         msg_lower = msg.lower()
-        if any(w in msg_lower for w in ["yes", "sure", "ok", "great"]):
+        affirmative_keywords = [
+            "yes", "sure", "ok", "okay", "great", "sounds good", "please",
+            "protocol", "routine", "generate", "pdf", "send"
+        ]
+        if any(w in msg_lower for w in affirmative_keywords):
             self.update_state(session_id, {"stage": "fork"})
             return ("Fantastic. I'm generating your **Personalized Wellness Protocol** PDF right now.\n\n"
                     "While that processes, would you like to see the **Clinical Garments** that support this protocol, "
