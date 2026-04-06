@@ -7,16 +7,25 @@ try:
 except Exception:
     spacy = None
 from services.clinical_library import CLINICAL_PROTOCOLS 
-from services.product_catalog import PRODUCT_CATALOG 
+from services.product_catalog import PRODUCT_CATALOG, get_products_for_path 
 from services.crm_service import CRMService 
 from services.safety_service import SafetyService
-from services.schemas import UserSessionState
+from services.schemas import UserSessionState, UserAbilityProfile
 from services.redaction import redact_phi
+from services.ability_intake_handler import AbilityIntakeHandler
+from services.ability_constants import ABILITY_TIERS
 from services.research_library import ResearchLibrary
 from services.response_interpreter import ResponseInterpreter
 from services.decision_router import DecisionRouter
 from services.protocol_generator import ProtocolGenerator
+from services.refinement_engine import RefinementEngine, ActiveProtocol, ProtocolItem, create_active_protocol_from_library
+from services.enterprise_logging import enterprise_logger
+from services.ai_summary_service import get_ai_summary_service
+from services.protocol_modifier import ProtocolModifier
 import logging
+
+# Backend URL for absolute PDF links (required when frontend is on a different domain, e.g. Vercel)
+BACKEND_URL = os.environ.get("BACKEND_URL", "").rstrip("/")
 
 # --- Global NLP Config ---
 try:
@@ -26,29 +35,95 @@ except Exception:
 
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 TITLE_PREFIXES = {"mr", "mrs", "ms", "dr", "prof", "sir", "madam"}
-INVALID_NAME_TOKENS = {"yes", "no", "sure", "ok", "okay", "hello", "hi", "hey", "yo", "is", "name"}
+INVALID_NAME_TOKENS = {"yes", "no", "sure", "ok", "okay", "hello", "hi", "hey", "yo", "is", "name", "email", "lead", "good", "morning", "afternoon", "evening", "thanks", "thank", "you", "greetings"}
 INVALID_NAME_VERBS = {"having", "feeling", "experiencing", "dealing", "getting", "hurting", "swelling", "pain", "aches", "aching"}
+
+CARDIO_ITEM_NAMES = {
+    "Aerobic Movement",
+    "Afternoon Walk",
+    "Thoracic Duct Pump Check",
+    "Arm Ergometer / Wheelchair Push",
+    "Seated Marching",
+    "Seated Upper-Body Cardio",
+}
+
+# --- Questionnaire Mode: Reusable Option Blocks ---
+GOAL_OPTIONS = (
+    "○ Swelling or heaviness\n"
+    "○ Post-surgery recovery\n"
+    "○ Smoother, firmer-looking skin\n"
+    "○ Exercise recovery\n"
+    "○ Pregnancy comfort\n"
+    "○ General wellness"
+)
+
+_GOAL_DESCRIPTORS = {
+    "lighter": "swelling or heaviness",
+    "postop": "post-surgery recovery",
+    "skin": "skin concerns",
+    "recovery": "exercise recovery",
+    "pregnancy": "pregnancy discomfort",
+    "wellness": "general wellness"
+}
+
+FORK_OPTIONS = (
+
+    "○ Browse compression garments\n"
+    "○ Book a consultation\n"
+    "○ I'm all set — thank you!"
+)
+
+def _is_cardio_item(name: str) -> bool:
+    return name in CARDIO_ITEM_NAMES if name else False
+
+def _cardio_contraindicated(state: Optional[UserSessionState], issue_type: str) -> bool:
+    if issue_type == "post_op":
+        return True
+    if state and state.context_trigger == "post_op":
+        return True
+    profile = state.ability_profile if state else None
+    if profile:
+        if profile.tier == "cardiac_pulm":
+            return True
+        if "wheelchair" in profile.accessibility_needs:
+            arm_use = profile.accessibility_details.get("wheelchair", {}).get("arm_use")
+            if arm_use == "no":
+                return True
+    return False
+
+def _apply_cardio_policy(items: List[Dict], state: Optional[UserSessionState], issue_type: str) -> List[Dict]:
+    if _cardio_contraindicated(state, issue_type):
+        return [item for item in items if not _is_cardio_item(item.get("name", ""))]
+
+    if any(item.get("name") == "Aerobic Movement" for item in items):
+        return items
+
+    for base_item in CLINICAL_PROTOCOLS.get("foundation", {}).get("items", []):
+        if base_item.get("name") == "Aerobic Movement":
+            return items + [dict(base_item)]
+
+    return items
 
 def _strip_title(name: str) -> str:
     parts = [p for p in re.split(r"\s+", name.strip()) if p]
     if not parts:
         return ""
-    first = parts[0].lower().strip(".,")
+    first = parts[0].lower().strip(".,:;")
     if first in TITLE_PREFIXES and len(parts) > 1:
         parts = parts[1:]
-    return parts[0].strip(".,") if parts else ""
+    return parts[0].strip(".,:;") if parts else ""
 
 def extract_name(text: str) -> str:
     """
-    Extracts a first name from a string.
-    Supports: "Call me Jim", "I am Jim", "Name: Jim", "Jim jim@email.com".
+    Extracts a first name from: "Call me Jim", "I am Jim", "Name: Jim", or fallback short msg.
     """
     # 1. Regex Pattern Matching (Priority)
-    match = re.search(r"(?:name is|i am|i'm|im|call me|it's|its|this is|name[:\s]+)\s+([A-Z][a-zA-Z'-]+)", text, re.IGNORECASE)
+    match = re.search(r"(?:name is|i am|i'm|im|call me|it's|its|this is|name[:\s]+)\s+([a-zA-Z'-]+)", text, re.IGNORECASE)
     if match:
         name = _strip_title(match.group(1))
         if name and name.lower() not in INVALID_NAME_TOKENS and name.lower() not in INVALID_NAME_VERBS:
-            return name
+            # Capitalize the name for consistency
+            return name.capitalize()
 
     # 2. spaCy NER (if available)
     if nlp:
@@ -58,7 +133,7 @@ def extract_name(text: str) -> str:
                 if ent.label_ == "PERSON":
                     name = _strip_title(ent.text)
                     if name and name.lower() not in INVALID_NAME_TOKENS and name.lower() not in INVALID_NAME_VERBS:
-                        return name
+                        return name.capitalize()
         except Exception:
             pass
 
@@ -66,12 +141,44 @@ def extract_name(text: str) -> str:
     words = [w.strip(".,!?;") for w in text.strip().split() if w.strip(".,!?;")]
     if len(words) <= 2:
         candidate = _strip_title(words[0])
-        if candidate and candidate.lower() not in INVALID_NAME_TOKENS and candidate.lower() not in INVALID_NAME_VERBS:
-            return candidate
+        # Must be alpha and not an email
+        if candidate and candidate.isalpha() and "@" not in candidate and candidate.lower() not in INVALID_NAME_TOKENS and candidate.lower() not in INVALID_NAME_VERBS:
+            return candidate.capitalize()
     return None
 
 def is_valid_email(email: str) -> bool:
-    return bool(email and EMAIL_REGEX.fullmatch(email))
+    """Validates email format AND checks for valid TLD."""
+    if not email or not EMAIL_REGEX.fullmatch(email):
+        return False
+    # Extract TLD and validate against common valid TLDs
+    tld = email.rsplit(".", 1)[-1].lower()
+    VALID_TLDS = {
+        "com", "org", "net", "edu", "gov", "io", "co", "us", "uk", "ca", "au", 
+        "de", "fr", "es", "it", "nl", "be", "ch", "at", "info", "biz", "me",
+        "tv", "cc", "name", "pro", "mobi", "xyz", "online", "site", "app",
+        "dev", "tech", "store", "health", "fit", "life", "email", "cloud"
+    }
+    if tld not in VALID_TLDS:
+        return False
+    return True
+
+def _normalize_weekly_total(dose: str) -> str:
+    if not dose:
+        return dose
+    pattern = re.compile(
+        r"(?P<total>\d+)\s*min/week(?P<tail>[^()]*)\(\s*(?P<per>\d+)\s*min\s*x\s*(?P<days>\d+)\s*days?\s*\)",
+        re.IGNORECASE
+    )
+    def _repl(match: re.Match) -> str:
+        total = int(match.group("total"))
+        per = int(match.group("per"))
+        days = int(match.group("days"))
+        calc = per * days
+        if calc == total:
+            return match.group(0)
+        day_word = "day" if days == 1 else "days"
+        return f"{calc} min/week{match.group('tail')}({per} min x {days} {day_word})"
+    return pattern.sub(_repl, dose)
 
 def redact_emails(text: str) -> str:
     if not text:
@@ -90,10 +197,8 @@ def parse_identity(text: str) -> Dict[str, Optional[str]]:
         name = None
 
     # If the extracted name looks like part of the email local name, try a better name
+    # [RELAXED] Allowing name even if it's in email local part (e.g. nadia@gmail.com -> Nadia is valid)
     local_part = email.split("@")[0].lower() if email else None
-    if email and name:
-        if local_part and name.lower() in local_part:
-            name = None
 
     # If name wasn't found but we have "Name: X" style
     if not name:
@@ -110,7 +215,7 @@ def parse_identity(text: str) -> Dict[str, Optional[str]]:
         for i, tok in enumerate(tokens):
             if email in tok and i > 0:
                 candidate = _strip_title(tokens[i - 1])
-                if candidate and candidate.lower() not in INVALID_NAME_TOKENS:
+                if candidate and candidate.isalpha() and candidate.lower() not in INVALID_NAME_TOKENS and candidate.lower() not in INVALID_NAME_VERBS:
                     name = candidate
                 break
 
@@ -120,7 +225,7 @@ def parse_identity(text: str) -> Dict[str, Optional[str]]:
         for i, tok in enumerate(tokens):
             if email in tok and i + 1 < len(tokens):
                 candidate = _strip_title(tokens[i + 1])
-                if candidate and candidate.isalpha() and candidate.lower() not in INVALID_NAME_TOKENS:
+                if candidate and candidate.isalpha() and candidate.lower() not in INVALID_NAME_TOKENS and candidate.lower() not in INVALID_NAME_VERBS:
                     name = candidate
                 break
 
@@ -128,11 +233,66 @@ def parse_identity(text: str) -> Dict[str, Optional[str]]:
     if email and not name:
         for tok in text.split():
             candidate = _strip_title(tok)
-            if candidate and candidate.isalpha() and candidate.lower() not in INVALID_NAME_TOKENS:
+            if candidate and candidate.isalpha() and candidate.lower() not in INVALID_NAME_TOKENS and candidate.lower() not in INVALID_NAME_VERBS:
                 name = candidate
                 break
 
     return {"name": name, "email": email}
+
+def _infer_accessibility_from_text(text: str) -> tuple:
+    """
+    Heuristic extraction of accessibility needs from free-text constraints.
+    """
+    t = (text or "").lower()
+    if not t:
+        return [], None
+
+    detected = []
+    wheelchair_arm_use = None
+
+    if re.search(r"\bwheel\s*chair\b|\bwheelchair\b", t):
+        detected.append("wheelchair")
+
+    arm_no_use_patterns = [
+        r"\b(can't|cannot|unable to)\s+(move|use)\s+(my\s+)?arms\b",
+        r"\bno\s+arm\s+use\b",
+        r"\bno\s+use\s+of\s+arms\b",
+        r"\bparaly(s|z)ed\s+arms\b",
+    ]
+    if any(re.search(p, t) for p in arm_no_use_patterns):
+        wheelchair_arm_use = "no"
+
+    arm_yes_use_patterns = [
+        r"\b(can|able to)\s+(use|move)\s+(my\s+)?arms\b",
+        r"\barm\s+use\b",
+    ]
+    if wheelchair_arm_use is None and any(re.search(p, t) for p in arm_yes_use_patterns):
+        wheelchair_arm_use = "yes"
+
+    leg_patterns = [
+        r"\b(can't|cannot|unable to)\s+(move|use)\s+(my\s+)?legs\b",
+        r"\b(no|zero)\s+leg\s+(movement|mobility)\b",
+        r"\bleg\s+paralysis\b",
+        r"\bparaly(s|z)ed\s+legs\b",
+        r"\bimmobile\s+legs\b",
+        r"\bnon[-\s]?weight\s*bearing\b",
+    ]
+    if any(re.search(p, t) for p in leg_patterns) or ("can't move them" in t and "leg" in t):
+        detected.append("legs")
+
+    arm_patterns = [
+        r"\b(can't|cannot|unable to)\s+(move|use)\s+(my\s+)?arms\b",
+        r"\barm\s+paralysis\b",
+        r"\bparaly(s|z)ed\s+arms\b",
+    ]
+    if any(re.search(p, t) for p in arm_patterns):
+        detected.append("arms")
+
+    if re.search(r"\b(can't|cannot|unable to)\s+stand\b|\bbalance\s+(is\s+)?difficult\b", t):
+        detected.append("balance")
+
+    # Deduplicate while preserving order
+    return list(dict.fromkeys(detected)), wheelchair_arm_use
 
 def detect_goal(text: str) -> Optional[str]:
     if not text:
@@ -142,7 +302,7 @@ def detect_goal(text: str) -> Optional[str]:
         return "consult"
     if any(k in t for k in ["shop", "buy", "purchase", "products", "leggings", "bra", "tank", "clothing"]):
         return "shop"
-    if any(k in t for k in ["protocol", "routine", "help", "support", "wellness", "swelling", "pain", "recovery"]):
+    if any(k in t for k in ["protocol", "routine", "help", "support", "wellness", "swelling", "pain", "recovery", "skin", "cellulite", "texture", "smoother", "firmer", "dimple"]):
         return "protocol"
     return None
 
@@ -150,7 +310,93 @@ def extract_primary_region(text: str) -> Optional[str]:
     if not text:
         return None
     t = text.lower()
-    if any(w in t for w in ["all over", "everywhere", "whole body", "entire body", "general", "overall", "full body"]):
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GENERAL WELLNESS KEYWORDS (100+ phrases)
+    # These catch open-ended responses and treat them as general wellness
+    # ═══════════════════════════════════════════════════════════════════════════
+    GENERAL_WELLNESS_KEYWORDS = [
+        # === BODY COVERAGE ===
+        "all over", "everywhere", "whole body", "entire body", "general", "overall", 
+        "full body", "total body", "head to toe", "everywhere hurts", "all areas",
+        
+        # === HEALTH & WELLNESS GOALS ===
+        "healthy", "health", "wellness", "well-being", "wellbeing", "stay healthy",
+        "remain healthy", "get healthy", "be healthy", "feel healthy", "healthier",
+        "prevention", "preventive", "preventative", "proactive", "self-care", "self care",
+        "maintain", "maintenance", "upkeep", "routine", "daily routine", "lifestyle",
+        
+        # === FEELING STATES ===
+        "feel good", "feel better", "feel great", "feel normal", "feel like myself",
+        "feel lighter", "feel less", "improve", "improvement", "relief", "reduce",
+        "help with", "help me", "need help", "looking for help", "want to feel",
+        
+        # === PREGNANCY & LIFE STAGES ===
+        "pregnant", "pregnancy", "expecting", "prenatal", "postnatal", "postpartum",
+        "having a baby", "with child", "trimester", "maternity", "motherhood",
+        "new mom", "breastfeeding", "nursing", "fertility", "trying to conceive",
+        "menopause", "perimenopause", "hormonal", "menstrual", "period", "pms",
+        "aging", "getting older", "senior", "elderly", "golden years",
+        
+        # === COMMON SYMPTOMS (GENERAL) ===
+        "swelling", "swollen", "puffy", "puffiness", "edema", "fluid", "water retention",
+        "bloated", "bloating", "inflammation", "inflamed", "stiff", "stiffness",
+        "heavy", "heaviness", "weighted", "tired", "fatigue", "exhausted", "sluggish",
+        "achy", "aching", "sore", "soreness", "discomfort", "uncomfortable",
+        "tight", "tightness", "pressure", "throbbing", "tingling", "numbness",
+        
+        # === OPEN-ENDED INTENTS ===
+        "just want to", "i want to", "i need to", "i'd like to", "i would like",
+        "hoping to", "trying to", "looking to", "want help", "need some help",
+        "could use", "would appreciate", "seeking", "searching for", "curious about",
+        "interested in", "wondering", "not sure", "don't know", "unsure what",
+        
+        # === RECOVERY & HEALING ===
+        "recover", "recovering", "healing", "heal", "bounce back", "get back to",
+        "return to normal", "back to myself", "feel myself again", "restore",
+        "rehabilitation", "rehab", "therapy", "treatment", "manage", "managing",
+        
+        # === LIFESTYLE & ACTIVITY ===
+        "active", "stay active", "be active", "get moving", "mobility", "movement",
+        "exercise", "workout", "fitness", "training", "sport", "sports", "athlete",
+        "desk job", "sitting all day", "on my feet", "standing all day", "sedentary",
+        "work from home", "office", "long hours", "shift work", "nurse", "teacher",
+        
+        # === POST-WORKOUT RECOVERY ===
+        "post workout", "post-workout", "after workout", "after training", "after gym",
+        "lactate", "lactic acid", "muscle recovery", "recovery", "sore muscles",
+        "doms", "foam roll", "foam rolling", "muscle soreness", "stiff after",
+        "crossfit", "mma", "hiit", "cardio", "lifting", "weights", "running",
+        "marathon", "triathlon", "gym", "after exercise", "cool down", "cooldown",
+        
+        # === QUALITY OF LIFE ===
+        "quality of life", "live better", "better life", "everyday", "daily",
+        "long term", "ongoing", "chronic", "persistent", "recurring", "constant",
+        "intermittent", "comes and goes", "on and off", "some days", "most days",
+        
+        # === COSMETIC & AESTHETIC ===
+        "cellulite", "dimpling", "skin", "skin texture", "tone", "toning",
+        "firm", "firming", "smooth", "smoothing", "contour", "contouring",
+        "slim", "slimming", "detox", "cleanse", "flush", "drainage", "toxins",
+        
+        # === TRAVEL & SITUATIONAL ===
+        "travel", "traveling", "flying", "flight", "airplane", "long flight",
+        "road trip", "driving", "sitting", "standing", "heat", "hot weather",
+        "summer", "humidity", "altitude", "vacation", "work trip",
+        
+        # === MEDICAL CONDITIONS (GENERAL MENTION) ===
+        "lymphedema", "lipedema", "venous", "circulation", "circulatory",
+        "dvt", "blood clot", "varicose", "spider veins", "vein", "veins",
+        "diabetes", "thyroid", "autoimmune", "fibromyalgia", "arthritis",
+        "cancer", "survivor", "treatment side effects", "medication",
+        
+        # === EMOTIONAL & CONVERSATIONAL ===
+        "just curious", "exploring options", "see what", "learn more",
+        "understand", "information", "advice", "guidance", "recommendation",
+        "suggestion", "tips", "strategies", "solutions", "options", "alternatives"
+    ]
+    
+    if any(w in t for w in GENERAL_WELLNESS_KEYWORDS):
         return "general"
     if any(w in t for w in ["surgery", "post-op", "lipo", "recovery"]):
         return "post_op"
@@ -178,24 +424,84 @@ def extract_context_trigger(text: str) -> Optional[str]:
         return "workout"
     if any(w in t for w in ["pregnant", "pregnancy", "maternity"]):
         return "pregnancy"
+    if any(w in t for w in ["born", "since birth", "congenital", "lifelong", "always had this"]):
+        return "daily"
+    if any(w in t for w in ["chronic", "no trigger", "no specific trigger", "no clear trigger", "nothing specific", "not sure why", "unknown trigger"]):
+        return "daily"
     if any(w in t for w in ["daily", "every day", "all day", "always", "all the time", "ongoing", "standing", "sitting", "desk", "work", "job", "long day", "long shift", "after work", "after a long day"]):
         return "daily"
     return None
 
 def extract_timing(text: str) -> Optional[str]:
+    """Extract timing preference from user message with comprehensive phrase matching."""
     if not text:
         return None
     t = text.lower()
-    if any(w in t for w in ["i dont know", "i don't know", "idk", "not sure", "unsure", "no idea", "unknown"]):
+    
+    # === UNCERTAIN / VARIABLE ===
+    UNCERTAIN_PHRASES = [
+        "i dont know", "i don't know", "idk", "not sure", "unsure", "no idea", "unknown",
+        "hard to say", "varies", "depends", "it changes", "different every day", "unpredictable"
+    ]
+    if any(w in t for w in UNCERTAIN_PHRASES):
         return "variable"
-    if any(w in t for w in ["all day", "all day long", "all the time", "anytime", "off and on", "throughout", "all of them", "doesnt matter", "doesn't matter", "no difference", "same", "the same", "always", "daily", "every day", "constant", "24 7", "24-7", "24/7"]):
+    
+    # === ALL DAY / CONSTANT (expanded) ===
+    ALL_DAY_PHRASES = [
+        # Direct all-day phrases
+        "all day", "all day long", "all the time", "all times", "any time", "anytime",
+        "throughout the day", "throughout", "the whole day", "whole day", "entire day",
+        
+        # Constant/persistent
+        "constant", "constantly", "continuous", "continuously", "persistent", "persistently",
+        "nonstop", "non-stop", "24 7", "24-7", "24/7", "around the clock", "never stops",
+        
+        # Always/daily
+        "always", "daily", "every day", "everyday", "each day", "day to day",
+        
+        # Doesn't matter / all options
+        "doesnt matter", "doesn't matter", "no difference", "same", "the same",
+        "all of them", "all three", "all of the above", "none specifically",
+        
+        # Off and on / intermittent but constant
+        "off and on", "on and off", "comes and goes", "fluctuates", "waxes and wanes",
+        
+        # Colloquial
+        "literally always", "pretty much always", "basically all day", "most of the day",
+        "from morning to night", "when i wake up till i sleep", "never really goes away"
+    ]
+    if any(w in t for w in ALL_DAY_PHRASES):
         return "all_day"
-    if any(w in t for w in ["morning", "am", "wake up", "waking", "first thing"]):
+    
+    # === MORNING ===
+    MORNING_PHRASES = [
+        "morning", "mornings", "am", "a.m.", "wake up", "waking up", "when i wake",
+        "first thing", "first thing in the morning", "upon waking", "early", "early morning",
+        "before noon", "before lunch", "start of day", "beginning of day", "sunrise"
+    ]
+    if any(w in t for w in MORNING_PHRASES):
         return "morning"
-    if any(w in t for w in ["afternoon", "midday", "lunch", "after lunch"]):
+    
+    # === AFTERNOON ===
+    AFTERNOON_PHRASES = [
+        "afternoon", "afternoons", "midday", "mid-day", "mid day", "noon", "noontime",
+        "lunch", "lunchtime", "after lunch", "middle of the day", "1pm", "2pm", "3pm", "4pm",
+        "early afternoon", "late afternoon", "post-lunch"
+    ]
+    if any(w in t for w in AFTERNOON_PHRASES):
         return "afternoon"
-    if any(w in t for w in ["evening", "night", "pm", "late in the day", "end of day", "after dinner", "sunset", "bedtime", "after work"]):
+    
+    # === EVENING / NIGHT ===
+    EVENING_PHRASES = [
+        "evening", "evenings", "night", "nights", "nighttime", "pm", "p.m.",
+        "late in the day", "end of day", "end of the day", "after dinner", "dinner time",
+        "sunset", "bedtime", "before bed", "going to bed", "lying down",
+        "after work", "when i get home", "5pm", "6pm", "7pm", "8pm", "9pm", "10pm",
+        "later in the day", "as the day goes on", "by evening", "towards evening"
+    ]
+    if any(w in t for w in EVENING_PHRASES):
         return "evening"
+    
     return None
 
 def _region_keywords(region: Optional[str]) -> list:
@@ -245,6 +551,7 @@ def _interpret_discovery(msg: str) -> Dict[str, Optional[str]]:
         "uncertain_region": False,
         "uncertain_context": False,
         "uncertain_timing": False,
+        "region_hits": [],
     }
     if _is_uncertain(t):
         info["uncertain_region"] = True
@@ -268,6 +575,7 @@ def _interpret_discovery(msg: str) -> Dict[str, Optional[str]]:
         info["region"] = list(region_hits)[0]
     elif len(region_hits) > 1:
         info["region"] = "general"
+        info["region_hits"] = list(region_hits)
     else:
         region = extract_primary_region(t)
         if region:
@@ -319,7 +627,9 @@ def _is_affirmative(msg: str) -> bool:
 
 def _is_negative(msg: str) -> bool:
     t = (msg or "").lower()
-    return any(w in t for w in ["no", "not now", "don't", "do not", "prefer not", "skip"])
+    if any(phrase in t for phrase in ["not now", "prefer not"]):
+        return True
+    return bool(re.search(r"\b(no|nope|nah|skip|don't|do not)\b", t))
 
 def _is_email_check(msg: str) -> bool:
     t = (msg or "").lower()
@@ -337,7 +647,10 @@ def _sanitize_no_dashes(text: str) -> str:
         key = f"__URL{len(urls)}__"
         urls[key] = match.group(0)
         return key
+    # Protect markdown links and URL-like paths before dash normalization
+    text = re.sub(r"\[[^\]]+\]\([^)]+\)", _protect_url, text)
     text = re.sub(r"https?://\S+", _protect_url, text)
+    text = re.sub(r"/static/\S+", _protect_url, text)
     text = text.replace("—", ". ").replace("–", ". ")
     text = text.replace(" - ", ". ")
     text = re.sub(r"(\d)\s*-\s*(\d)", r"\1 to \2", text)
@@ -347,7 +660,13 @@ def _sanitize_no_dashes(text: str) -> str:
         text = text.replace(key, url)
     return text
 
-def _build_user_summary(state: Optional[UserSessionState]) -> Optional[str]:
+def _is_constraint_noise(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(phrase in t for phrase in ["no trigger", "no specific trigger", "unknown trigger"])
+
+def _build_user_summary_core(state: Optional[UserSessionState]) -> Optional[str]:
     if not state:
         return None
     region_map = {
@@ -384,8 +703,24 @@ def _build_user_summary(state: Optional[UserSessionState]) -> Optional[str]:
 
     if not sentences:
         return None
-    summary = "Here is what I heard. " + " ".join(sentences)
-    return summary
+    return " ".join(sentences)
+
+
+def _build_user_summary(state: Optional[UserSessionState]) -> Optional[str]:
+    core = _build_user_summary_core(state)
+    if not core:
+        return None
+    return f"Here is what I heard. {core}"
+
+
+def _build_user_summary_for_protocol(state: Optional[UserSessionState]) -> Optional[str]:
+    core = _build_user_summary_core(state)
+    if not core:
+        return None
+    extra = ""
+    if state and state.extra_context and state.extra_context not in ("none", "None"):
+        extra = f" I'll keep in mind: {state.extra_context}."
+    return f"Thanks for your answers. {core}{extra}"
 
 def _get_attempts(state: Optional[UserSessionState], key: str) -> int:
     if not state or not state.question_attempts:
@@ -442,71 +777,145 @@ class ConversationManager:
         self.states[session_id] = UserSessionState(**updated_data)
 
     async def process_turn(self, session_id: str, user_msg: str, user_email: Optional[str] = None) -> str:
-        # 0A. Universal Safety Rail (Hard Refusal)
-        safety_refusal = SafetyService.check_emergency(user_msg)
-        if safety_refusal:
-             return safety_refusal
+        import time
+        _start_time = time.time()
+
+        state = self.get_state(session_id)
+        email_context = user_email or (state.user_email if state else None)
 
         # Telemetry
         if self.analytics:
              self.analytics.track_message(session_id, "user", user_msg)
 
-        state = self.get_state(session_id)
+        # Log User Message to CRM + Enterprise Logger
+        enterprise_logger.log_conversation_event(
+            session_id=session_id,
+            event_type="message_received",
+            user_email=email_context,
+            msg_preview=user_msg[:50] if len(user_msg) > 50 else user_msg
+        )
+        if self.crm:
+             self.crm.log_interaction(session_id, "user", user_msg, email=email_context, source="user")
+
+        # Session takeover: pause bot replies, keep logging user input
+        if self.crm and self.crm.is_takeover_active(session_id):
+             # Log the user message but don't auto-reply — admin is handling this chat
+             return await self._finalize_response(session_id, user_msg, "", source="system")
+
+        # 0A. Universal Safety Rail (Hard Refusal)
+        safety_refusal = SafetyService.check_emergency(user_msg)
+        if safety_refusal:
+             enterprise_logger.warning("Safety refusal triggered", session_id=session_id, user_email=email_context)
+             return await self._finalize_response(session_id, user_msg, safety_refusal, source="system")
+
         msg_lower = user_msg.lower()
         
-        # 0B. Handle System Start
-        if user_msg == "Event: Start":
+        # 0B. Handle System Start / Reset
+        if user_msg in ("Event: Start", "Event: Reset"):
             if self.analytics: self.analytics.track_session_start(session_id, {"email_provided": bool(user_email)})
+
+            # Reset: start a fresh protocol build for this user (new session id) without
+            # using the CRM "resume" welcome-back messaging.
+            if user_msg == "Event: Reset":
+                # Ensure this session starts clean even if the same id is reused.
+                self.states[session_id] = UserSessionState(session_id=session_id)
+                state = self.get_state(session_id)
+
+                if user_email:
+                    crm_name = None
+                    try:
+                        last_active = self.crm.get_last_interaction(user_email) if self.crm else None
+                        if last_active and last_active.get("user_name"):
+                            crm_name = last_active.get("user_name")
+                    except Exception:
+                        crm_name = None
+
+                    self.update_state(session_id, {
+                        "user_name": crm_name,
+                        "user_email": user_email,
+                        "stage": "goal_capture",
+                    })
+
+                    name_prefix = f"{crm_name}, " if crm_name else ""
+                    response = (
+                        f"All set, {name_prefix}let's start fresh.\n\n"
+                        f"What's the main concern you'd like to address today?\n\n{GOAL_OPTIONS}"
+                    )
+                    return await self._finalize_response(session_id, user_msg, response)
+
+                # No email available -> go through identity capture again
+                self.update_state(session_id, {"stage": "identity_capture"})
+                response = ("Hello! I'm **Sarah**, your Lymphatic Wellness Guide.\n\n"
+                            "To remember your needs and build your **personalized lymphatic wellness protocol**, "
+                            "I just need your **First Name** and a **valid Email Address**.")
+                return await self._finalize_response(session_id, user_msg, response)
             
             # Scenario 1: Active Session (Same Session ID)
             if state.user_name:
                 self.crm.log_interaction(session_id, "System", "Welcome Back trigger")
+                # Proceed directly to protocol flow - that's our mission
+                self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
                 response = (f"Welcome back, {state.user_name}! "
-                            "What are you looking to accomplish today? "
-                            "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                            "Let's continue building your personalized lymphatic wellness protocol.\n\n"
+                            f"What's the main concern you'd like to address today?\n\n{GOAL_OPTIONS}")
                 return await self._finalize_response(session_id, user_msg, response)
             
             # Scenario 2: New Session + Known Email (Smart Retention)
-                if user_email:
-                    # [NEW] Check CRM for History
-                    last_active = self.crm.get_last_interaction(user_email)
-                    
-                    if last_active and last_active.get("user_name"):
-                        crm_name = last_active["user_name"]
-                    
-                    # Pre-fill State
-                        self.update_state(session_id, {
-                            "user_name": crm_name,
-                            "user_email": user_email,
-                            "stage": "goal_capture"
-                        })
-
-                        # Smart Context Greeting (Intent-Aware)
-                        intent = last_active.get("intent")
-                        last_stage = last_active.get("stage")
-
-                        if intent:
-                            response = (f"Welcome back, {crm_name}! Last time we were working on your **{intent}**. "
-                                        "What are you looking to accomplish today? "
-                                        "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
-                            return await self._finalize_response(session_id, user_msg, response)
-                    
-                    # No specific protocol yet? Ask generic but personalized.
-                    response = (f"Welcome back, {crm_name}! "
-                                "What are you looking to accomplish today? "
-                                "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
-                    return await self._finalize_response(session_id, user_msg, response)
+            if user_email:
+                # [NEW] Check CRM for History
+                last_active = self.crm.get_last_interaction(user_email)
                 
+                if last_active and last_active.get("user_name"):
+                    crm_name = last_active["user_name"]
+                
+                    # Pre-fill State
+                    self.update_state(session_id, {
+                        "user_name": crm_name,
+                        "user_email": user_email,
+                        "stage": "goal_capture"
+                    })
+
+                    # Smart Context Greeting (Intent-Aware)
+                    intent = last_active.get("intent")
+                    last_stage = last_active.get("stage")
+                    protocol_url = last_active.get("protocol_url")
+                    protocol_summary = last_active.get("protocol_summary")
+
+                    if protocol_url and protocol_summary:
+                        # PDF was delivered - show summary, re-link PDF, offer new protocol
+                        self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                        response = (f"Welcome back, {crm_name}! Last time I put together your **{protocol_summary}**.\n\n"
+                                    f"[Download your protocol again]({protocol_url})\n\n"
+                                    f"Would you like to create **another protocol**?\n\n{GOAL_OPTIONS}")
+                        return await self._finalize_response(session_id, user_msg, response)
+                    elif intent:
+                        # In-progress, no PDF yet - offer to resume
+                        self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                        response = (f"Welcome back, {crm_name}! Last time we were working on your "
+                                    f"**tailored protocol for your {intent}**.\n\n"
+                                    f"Would you like to **continue**, or start fresh?\n\n"
+                                    f"○ Continue where we left off\n{GOAL_OPTIONS}")
+                        return await self._finalize_response(session_id, user_msg, response)
+                
+                    # No specific protocol yet - proceed to protocol flow
+                    self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                    response = (f"Welcome back, {crm_name}! "
+                                "Let's build your personalized lymphatic wellness protocol.\n\n"
+                                f"What's the main concern you'd like to address?\n\n{GOAL_OPTIONS}")
+                    return await self._finalize_response(session_id, user_msg, response)
+
                 # Known Email but NO Name in CRM? -> Identity Capture (Strict)
                 self.update_state(session_id, {"stage": "identity_capture", "user_email": user_email})
-                return f"Welcome back! I see you're logged in as {user_email}, but I don't have your first name on file yet. **What should I call you?**"
-            
-            else:
-                self.update_state(session_id, {"stage": "identity_capture"})
-                response = ("Hello! I'm **Sarah**, your Lymphatic Wellness Guide.\n\n"
-                        "To remember your needs and build your **personalized lymphatic wellness protocol**, "
-                        "I just need your **First Name** and a **valid Email Address**.")
+                response = (f"Welcome back! I see you're logged in as {user_email}, but I don't have your first name yet. "
+                            "What should I call you?")
                 return await self._finalize_response(session_id, user_msg, response)
+        
+            # If no email provided, start identity capture
+            self.update_state(session_id, {"stage": "identity_capture"})
+            response = ("Hello! I'm **Sarah**, your Lymphatic Wellness Guide.\n\n"
+                    "To remember your needs and build your **personalized lymphatic wellness protocol**, "
+                    "I just need your **First Name** and a **valid Email Address**.")
+            return await self._finalize_response(session_id, user_msg, response)
 
         stage = state.stage
         
@@ -526,9 +935,10 @@ class ConversationManager:
 
                 # Validate Email
                 if not is_valid_email(email_part):
-                    return ("Thanks! That doesn't look like a valid email address. "
-                            "I need a **valid email** to remember your needs and build your **custom lymphatic wellness protocol**. "
-                            "What's the best email to use?")
+                    response = ("Thanks! That doesn't look like a valid email address. "
+                                "I need a **valid email** to remember your needs and build your **custom lymphatic wellness protocol**. "
+                                "What's the best email to use?")
+                    return await self._finalize_response(session_id, user_msg, response)
                 
                 # [AI-POWERED] Smart Extraction
                 # Pre-fill with Regex result (Strong Signal)
@@ -558,22 +968,31 @@ class ConversationManager:
 
                 email_extracted = email_part
                 
-                # We have BOTH Name and Email. Proceed.
-                # Persist
-                self.update_state(session_id, {"stage": "goal_capture", "user_email": email_part, "user_name": name_part})
+                # We have BOTH Name and Email. Proceed to ability intake.
+                # Persist contact and start ability intake
+                self.update_state(session_id, {
+                    "stage": "ability_intake",
+                    "ability_intake_stage": "permission",
+                    "user_email": email_part,
+                    "user_name": name_part
+                })
                 if self.crm:
                     self.crm.create_or_update_contact(email=email_part, first_name=name_part)
                 
-                # If they already described symptoms, go straight to discovery without jumping into protocol
-                is_diagnosis_keyword = any(w in user_msg.lower() for w in ["swelling", "ankle", "leg", "surgery", "post op", "post-op", "lipo", "recovery", "protocol", "product", "leggings", "hurt", "pain"])
+                # If they already described symptoms, skip ability intake and go to discovery
+                is_diagnosis_keyword = any(w in user_msg.lower() for w in ["swelling", "ankle", "leg", "surgery", "post op", "post-op", "lipo", "recovery", "hurt", "pain"])
                 if is_diagnosis_keyword:
-                    self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                    # Create default ability profile and go straight to discovery
+                    self.update_state(session_id, {
+                        "goal": "protocol",
+                        "stage": "discovery",
+                        "ability_profile": UserAbilityProfile(tier="average", intake_completed=True)
+                    })
                     response = f"Thanks {name_part}! I've saved your profile. {self._handle_discovery(session_id, user_msg)}"
                     return await self._finalize_response(session_id, user_msg, response)
 
-                response = (f"Thanks {name_part}! I've saved your profile. "
-                            "What are you looking to accomplish today? "
-                            "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                # Start ability intake with permission message
+                response = f"Thanks {name_part}! I've saved your profile.\n\n{AbilityIntakeHandler.get_permission_message()}"
                 return await self._finalize_response(session_id, user_msg, response)
 
             # If message contains '@' but no valid email match, prompt for a valid email
@@ -598,14 +1017,17 @@ class ConversationManager:
             if parsed_name and not is_greeting:
                 # 1. Check if we already have their email (from previous turn)
                 if state.user_email:
-                    # Success! We have both.
-                    self.update_state(session_id, {"stage": "goal_capture", "user_name": parsed_name})
+                    # Success! We have both. Start ability intake.
+                    self.update_state(session_id, {
+                        "stage": "ability_intake",
+                        "ability_intake_stage": "permission",
+                        "user_name": parsed_name
+                    })
                     if self.crm:
                          self.crm.create_or_update_contact(email=state.user_email, first_name=parsed_name)
                     
-                    response = (f"Thanks {parsed_name}! I've saved your profile. "
-                                "What are you looking to accomplish today? "
-                                "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                    # Start ability intake with permission message
+                    response = f"Thanks {parsed_name}! I've saved your profile.\n\n{AbilityIntakeHandler.get_permission_message()}"
                     return await self._finalize_response(session_id, user_msg, response)
 
                 # 2. No email yet? Save temp name and ask.
@@ -620,6 +1042,11 @@ class ConversationManager:
                             "To remember your needs and build your **custom lymphatic wellness protocol**, "
                             "I just need your **First Name and a valid Email Address**.")
                 return await self._finalize_response(session_id, user_msg, response)
+
+        # 1.5. Ability Intake Stage (NEW: Adaptive Protocol System)
+        if stage == "ability_intake":
+            response = self._handle_ability_intake(session_id, user_msg)
+            return await self._finalize_response(session_id, user_msg, response)
 
         # 2. Main Diagnosis Logic (The V3 Core)
         if stage == "goal_capture":
@@ -637,25 +1064,61 @@ class ConversationManager:
                         "No problem. Most people start with a lymphatic wellness protocol. Does that sound right?"
                     )
             if _is_email_check(user_msg) and state.user_email:
-                response = (f"I have your email as **{state.user_email}**. "
-                            "What are you looking to accomplish today? "
-                            "A lymphatic wellness protocol, shopping, or a 1:1 consult?")
+                # Confirm email and continue with protocol flow
+                self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                response = (f"I have your email as **{state.user_email}**.\n\n"
+                            f"Now, let's build your personalized protocol. What's the main concern you'd like to address?\n\n{GOAL_OPTIONS}")
                 return await self._finalize_response(session_id, user_msg, response)
-            goal = detect_goal(user_msg)
+
+            # Map numeric option-button selections to synthetic goal text
+            _GOAL_OPTION_MAP = {
+                "1": {"text": "swelling heaviness",    "key": "lighter"},
+                "2": {"text": "post-surgery recovery", "key": "postop"},
+                "3": {"text": "cellulite skin",        "key": "skin"},
+                "4": {"text": "recovery training",     "key": "recovery"},
+                "5": {"text": "pregnancy",             "key": "pregnancy"},
+                "6": {"text": "general wellness",      "key": "wellness"},
+            }
+            goal_entry = _GOAL_OPTION_MAP.get(user_msg.strip())
+            if goal_entry:
+                effective_msg = goal_entry["text"]
+                self.update_state(session_id, {"goal_key": goal_entry["key"]})
+            else:
+                effective_msg = user_msg
+                # Infer goal_key from free-text
+                _TEXT_TO_KEY = {
+                    "lighter": ["swelling", "swollen", "heaviness", "heavy", "puffy", "puffiness", "edema", "lighter"],
+                    "postop": ["surgery", "post-surgery", "post-op", "procedure", "lipo", "liposuction"],
+                    "skin": ["cellulite", "skin", "texture", "firmer", "smoother", "dimpling"],
+                    "recovery": ["recovery", "training", "workout", "exercise", "sport", "athlete", "running"],
+                    "pregnancy": ["pregnant", "pregnancy", "expecting", "trimester", "postpartum"],
+                    "wellness": ["wellness", "general", "maintenance", "healthy", "prevention"],
+                }
+                msg_l = effective_msg.lower()
+                for gk, keywords in _TEXT_TO_KEY.items():
+                    if any(w in msg_l for w in keywords):
+                        self.update_state(session_id, {"goal_key": gk})
+                        break
+
+            goal = detect_goal(effective_msg)
             if not goal:
                 symptom_keywords = ["swelling", "swollen", "ankle", "leg", "legs", "pain", "hurt", "ache", "aching", "heavy", "edema", "puffy", "cankle"]
-                if any(w in msg_lower for w in symptom_keywords):
+                if any(w in effective_msg.lower() for w in symptom_keywords):
                     self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
-                    response = self._handle_discovery(session_id, user_msg)
+                    response = self._handle_discovery(session_id, effective_msg)
                     return await self._finalize_response(session_id, user_msg, response)
                 if _is_uncertain(user_msg):
                     self.update_state(session_id, {"pending_goal_default": True})
-                    response = "No problem. Most people start with a lymphatic wellness protocol. Does that sound right?"
+                    response = ("No problem. Most people start with a lymphatic wellness protocol. Does that sound right?\n\n"
+                                "○ Yes, that sounds good\n"
+                                "○ No, I have something else in mind")
                     return await self._finalize_response(session_id, user_msg, response)
-                response = ("What are you looking to accomplish today? "
-                            "**a lymphatic wellness protocol**, **shopping**, or **a 1:1 consult**?")
+                # Re-prompt with option buttons
+                response = ("My role is to design wellness protocols tailored to your specific needs.\n\n"
+                            f"What's the main concern you'd like to address?\n\n{GOAL_OPTIONS}")
                 return await self._finalize_response(session_id, user_msg, response)
 
+            # goal_key was already set above from _GOAL_OPTION_MAP or text inference
             self.update_state(session_id, {"goal": goal, "stage": "discovery"})
 
             if goal == "consult":
@@ -664,8 +1127,16 @@ class ConversationManager:
                 return await self._finalize_response(session_id, user_msg, response)
 
             # Protocol or Shopping intent flows into discovery
-            response = self._handle_discovery(session_id, user_msg)
-            return await self._finalize_response(session_id, user_msg, response)
+            if goal == "protocol" or goal_key:
+                # If we have a goal_key but detect_goal returned None, force goal to protocol
+                if not goal and goal_key:
+                    goal = "protocol"
+                    self.update_state(session_id, {"goal": goal, "stage": "discovery"})
+                
+                response = self._handle_discovery(session_id, user_msg)
+                return await self._finalize_response(session_id, user_msg, response)
+            
+            return await self._finalize_response(session_id, user_msg, "I'm not sure I understood that. Could you clarify your goal?")
 
         if stage == "discovery":
             response = self._handle_discovery(session_id, user_msg)
@@ -702,15 +1173,43 @@ class ConversationManager:
             response = self._handle_fork(session_id, user_msg)
             return await self._finalize_response(session_id, user_msg, response)
             
+        elif stage == "complete":
+            response = ("It was great chatting with you! Your protocol is saved and ready to download anytime.\n\n"
+                       "To start a new assessment, just click **Restart Chat** or refresh the page. "
+                       "Take care! 😊")
+            return await self._finalize_response(session_id, user_msg, response)
+            
         response = "I'm listening. Tell me more about what you're feeling in your body today."
         return await self._finalize_response(session_id, user_msg, response)
 
-    async def _finalize_response(self, session_id: str, user_msg: str, response: str) -> str:
-        if not self.llm_rewriter:
-            return _sanitize_no_dashes(response)
+    async def _finalize_response(self, session_id: str, user_msg: str, response: str, source: str = "bot") -> str:
         state = self.get_state(session_id)
-        rewritten = await self.llm_rewriter.rewrite(user_msg, response, state)
-        return _sanitize_no_dashes(rewritten)
+        # Optional: prepend LLM-generated empathy preamble (tailored to last user input)
+        if self.llm_rewriter and getattr(self.llm_rewriter, "preamble_enabled", False):
+            fallback = getattr(state, "pending_preamble_fallback", None) if state else None
+            context = {
+                "issue_type": getattr(state, "last_issue_type", None) or getattr(state, "primary_region", None),
+                "goal": getattr(state, "goal", None),
+            }
+            preamble = await self.llm_rewriter.generate_preamble(user_msg, state, context=context)
+            prefix = preamble or fallback
+            if prefix:
+                response = f"{prefix}\n\n{response.lstrip()}"
+            if fallback:
+                self.update_state(session_id, {"pending_preamble_fallback": None})
+
+        if self.llm_rewriter:
+            rewritten = await self.llm_rewriter.rewrite(user_msg, response, state)
+            final_response = _sanitize_no_dashes(rewritten)
+        else:
+            final_response = _sanitize_no_dashes(response)
+
+        # Log Assistant message to CRM with email context
+        if self.crm:
+            email = state.user_email if state else None
+            self.crm.log_interaction(session_id, "assistant", final_response, email=email, source=source)
+
+        return final_response
 
     def _handle_diagnosis_v3(self, session_id, msg):
         """
@@ -726,17 +1225,28 @@ class ConversationManager:
         
         # Detect Body Part / Issue
         issue_type = "foundation" # Default
+        region_hits = set()
         if any(w in msg_lower for w in ["surgery", "post-op", "post_op", "postop", "lipo", "recovery"]):
             issue_type = "post_op"
-        elif any(w in msg_lower for w in ["leg", "ankle", "foot", "feet", "calf", "calves", "cankle"]):
-            issue_type = "legs"
-        elif any(w in msg_lower for w in ["arm", "hand", "finger", "elbow"]):
-            issue_type = "arms"
-        elif any(w in msg_lower for w in ["neck", "face", "jaw"]):
-            issue_type = "neck"
-            
-        elif any(w in msg_lower for w in ["neck", "face", "jaw"]):
-            issue_type = "neck"
+        if any(w in msg_lower for w in ["leg", "ankle", "foot", "feet", "calf", "calves", "cankle"]):
+            region_hits.add("legs")
+        if any(w in msg_lower for w in ["arm", "hand", "finger", "elbow"]):
+            region_hits.add("arms")
+        if any(w in msg_lower for w in ["neck", "face", "jaw"]):
+            region_hits.add("neck")
+        if issue_type != "post_op":
+            if len(region_hits) > 1:
+                # Make human-readable: "legs and arms" instead of "multi"
+                region_list = sorted(list(region_hits))
+                if len(region_list) == 2:
+                    issue_type = f"{region_list[0]} and {region_list[1]}"
+                else:
+                    issue_type = ", ".join(region_list[:-1]) + f", and {region_list[-1]}"
+            elif len(region_hits) == 1:
+                issue_type = list(region_hits)[0]
+
+        # Persist last issue type for downstream empathy/preamble generation
+        self.update_state(session_id, {"last_issue_type": issue_type})
             
         # [NEW] Log Primary Intent to CRM for Smart Retention
         state = self.get_state(session_id)
@@ -754,7 +1264,18 @@ class ConversationManager:
                      "Are you managing **daily swelling/heaviness**, recovering from **surgery**, or looking for **general wellness**?")
 
         # Select Protocol
-        selected_protocol = CLINICAL_PROTOCOLS.get(issue_type, CLINICAL_PROTOCOLS["foundation"])
+        if issue_type == "multi":
+            selected_protocols = [CLINICAL_PROTOCOLS.get(hit) for hit in region_hits if CLINICAL_PROTOCOLS.get(hit)]
+            selected_protocol = {"title": "Multi-Region Protocol", "items": []}
+            seen = set()
+            for proto in selected_protocols:
+                for item in proto.get("items", []):
+                    name = item.get("name")
+                    if name and name not in seen:
+                        seen.add(name)
+                        selected_protocol["items"].append(item)
+        else:
+            selected_protocol = CLINICAL_PROTOCOLS.get(issue_type, CLINICAL_PROTOCOLS["foundation"])
         
         # 1. Intent Bifurcation (Restorative vs. Performance)
         # Check for Performance/Active Lifestyle keywords
@@ -776,6 +1297,8 @@ class ConversationManager:
                 intro = "Thanks for sending the photo. **I can see the tissue density around the ankle specifically.** That looks heavy and uncomfortable to walk on."
             elif issue_type == "post_op":
                 intro = "I see the bruising in the photo. Recovery is a journey, and that inflammation is your body's way of protecting itself, but it can feel stiff."
+            elif issue_type == "multi":
+                intro = "Thanks for the visual. I can see why multiple areas feel heavy. We can work both regions safely."
             else:
                 intro = "Thanks for the visual. I can see exactly what you mean about the swelling there."
         else:
@@ -791,9 +1314,17 @@ class ConversationManager:
                 intro = "I understand completely. Post op swelling is tricky because we want to move the fluid without disturbing the healing tissue."
             elif issue_type == "arms":
                 intro = "That heaviness in the arms can be frustrating. It often happens when the axillary (armpit) pathway is sluggish."
+            elif issue_type == "multi":
+                intro = "Thanks for sharing that. When multiple areas feel swollen, we can sequence a routine that supports both safely."
             else:
                  # Foundation / Default
                 intro = "Thanks for sharing. It sounds like you want to support your body's natural flow, which is the foundation of energy and health."
+
+        # Allow LLM to generate the empathy preamble, keep a fallback intro
+        use_llm_preamble = bool(self.llm_rewriter and getattr(self.llm_rewriter, "preamble_enabled", False))
+        if use_llm_preamble:
+            self.update_state(session_id, {"pending_preamble_fallback": intro})
+            intro = ""
 
         # --- C. Layer 2: Education (The Bridge) ---
         bridge = ""
@@ -810,14 +1341,18 @@ class ConversationManager:
              bridge_core = ("\n\n**Here is what's happening:**\n"
                             "The axillary (armpit) lymph nodes are the main drain for the arms. When they get congested or stagnant, "
                             "fluid backs up into the hands and triceps. We need to clear the drain first.")
+        elif issue_type == "multi":
+             bridge_core = ("\n\n**Here is the underlying mechanics:**\n"
+                            "When multiple regions feel heavy, we want to open the central pathways first and then sequence movement for each area. "
+                            "That improves overall flow without overloading any one region.")
         else:
              bridge_core = ("\n\n**Here is the science:**\n"
                             "The lymphatic system is your body's sewage treatment plant. Without a pump, it needs specific targeted movements "
                             "(like deep breathing) to create the pressure changes that move fluid.")
 
         summary = _build_user_summary(state)
-        if summary and not state.extra_context:
-            bridge = f"\n\n{summary} If I missed anything, tell me."
+        if summary:
+            bridge = f"\n\n{summary}"
         bridge += bridge_core
 
         # [NEW] Micro-value insert (science-backed), if available
@@ -830,10 +1365,35 @@ class ConversationManager:
             bridge += f"\n\n**Science Snapshot:** {micro_value}"
 
         # --- D. Layer 3: Conversational Protocol (The Prescription) ---
+        # [ADAPTIVE PROTOCOL] Apply ability-based modifications
+        protocol_items_raw = _apply_cardio_policy(selected_protocol.get('items', []), state, issue_type)
+        ability_profile = state.ability_profile
+        
+        if ability_profile and ability_profile.intake_completed:
+            # Apply dose multipliers, accessibility filters, pregnancy mods
+            modified_items = ProtocolModifier.modify_protocol(
+                protocol_items_raw,
+                ability_profile,
+                session_id=session_id
+            )
+            # Add ability summary to prescription header
+            ability_summary = ProtocolModifier.get_protocol_summary_for_ability(ability_profile)
+            enterprise_logger.log_protocol_generated(
+                session_id=session_id,
+                protocol_title=selected_protocol.get('title', 'Unknown'),
+                ability_tier=ability_profile.tier,
+                multiplier=ability_profile.tier_multiplier if hasattr(ability_profile, 'tier_multiplier') else None
+            )
+        else:
+            modified_items = protocol_items_raw
+            ability_summary = None
+        
         # Improved Formatting for readability
         prescription = ["\n\n**Here is a Science Backed Routine tailored for you:**"]
+        if ability_summary:
+            prescription.append(f"\n_({ability_summary})_")
         
-        for item in selected_protocol['items']:
+        for item in modified_items:
             # Create conversational linkage
             item_name = item['name']
             instruction = item['instruction']
@@ -855,7 +1415,7 @@ class ConversationManager:
             prescription.append(f"    *Do:* {instruction}")
 
             # [NEW] Dosage Information
-            dose = item.get("dose")
+            dose = _normalize_weekly_total(item.get("dose")) if item.get("dose") else None
             if dose:
                 prescription.append(f"    *Dose:* {dose}")
 
@@ -870,29 +1430,356 @@ class ConversationManager:
 
         # --- E. Layer 4: The Tool (Product Recommendation) ---
         # The "Soft Sell" - positioned as a tool to support the habit
+        goal_key = state.goal_key or "wellness"
+        
+        # Default product logic based on issue_type (region)
         product = PRODUCT_CATALOG.get(issue_type)
+        if issue_type == "multi":
+            # Prefer legs if included, else arms
+            if "legs" in region_hits:
+                product = PRODUCT_CATALOG.get("legs")
+            elif "arms" in region_hits:
+                product = PRODUCT_CATALOG.get("arms") or PRODUCT_CATALOG.get("bra")
+
+        # Goal-Specific Overrides or Phrasing
+        if goal_key == "skin" and not product:
+            product = PRODUCT_CATALOG.get("bra") # Bra is a common skin-focused recommendation
+
         if product:
-            prescription.append(f"\n\n**Supportive Tool:**")
-            prescription.append(f"To make this habit easier, many clients use the **{product['name']}**.")
-            prescription.append(f"> *{product['mechanism']}*")
-            prescription.append(f"[Show Me]({product['url']})")
+            if goal_key == "skin":
+                intro_text = f"To help with {(_GOAL_DESCRIPTORS.get('skin'))}, many of our clients use the **{product['name']}** as a supportive tool."
+            else:
+                intro_text = f"To make this habit easier, many clients use the **{product['name']}**."
+            
+            prescription.append("\n\n**Supportive Tool:**")
+            prescription.append(f"\n{intro_text}")
+            prescription.append(f"\n> *{product['mechanism']}*")
+            prescription.append(f"\n[Show Me]({product['url']})")
+
 
         # --- F. Closing ---
-        closing = "\n\nDoes this routine feel manageable, or would you like any changes or questions before we finalize it?"
+        closing = ("\n\nDoes this routine feel manageable, or would you like any changes or questions before we finalize it?\n\n"
+                   "○ Yes, looks good!\n"
+                   "○ I'd like to adjust\n"
+                   "○ Can I ask a question?")
         
         # Combine
         full_response = intro + bridge + "".join(prescription) + closing
         
         # Update State
         protocol_items = []
-        for item in selected_protocol.get("items", []):
+        active_items = []
+        for item in modified_items:
             action = item.get("name")
-            details = item.get("dose") or item.get("instruction")
+            normalized_dose = _normalize_weekly_total(item.get("dose")) if item.get("dose") else None
+            details = normalized_dose or item.get("instruction")
             if action and details:
-                protocol_items.append({"action": action, "details": details})
-        self.update_state(session_id, {"stage": "agreement", "agreed_protocol": [selected_protocol['title']], "protocol_items": protocol_items})
+                protocol_items.append({
+                    "action": action,
+                    "details": details,
+                    "instruction": item.get("instruction"),
+                    "urls": item.get("urls", []),
+                    "evidence": item.get("evidence"),
+                    "mechanism": item.get("mechanism"),
+                    "adjustment_note": item.get("adjustment_note"),
+                    "segment": item.get("segment"),
+                })
+            if action:
+                active_items.append(
+                    ProtocolItem(
+                        name=action,
+                        instruction=item.get("instruction", ""),
+                        dose_text=normalized_dose or item.get("instruction", ""),
+                        urls=item.get("urls", []) or []
+                    )
+                )
+
+        active_protocol = ActiveProtocol(title=selected_protocol.get("title", "Protocol"), items=active_items)
+        self.update_state(
+            session_id,
+            {
+                "stage": "agreement",
+                "agreed_protocol": [selected_protocol['title']],
+                "protocol_items": protocol_items,
+                "active_protocol_data": active_protocol.to_dict()
+            }
+        )
         
         return full_response
+
+    def _handle_ability_intake(self, session_id: str, msg: str) -> str:
+        """
+        Handles the ability intake stages: permission, health_status, mobility, and follow-ups.
+        Collects user's ability profile for personalized protocol generation.
+        """
+        state = self.get_state(session_id)
+        intake_stage = state.ability_intake_stage or "permission"
+        msg_lower = msg.lower()
+        
+        # Initialize ability profile if not exists
+        if not state.ability_profile:
+            self.update_state(session_id, {"ability_profile": UserAbilityProfile()})
+            state = self.get_state(session_id)
+        
+        profile = state.ability_profile
+        
+        # ==========================================
+        # STAGE: Permission (asking to start intake)
+        # ==========================================
+        if intake_stage == "permission":
+            # User confirms they're ready to start
+            if any(w in msg_lower for w in ["yes", "ready", "start", "sure", "ok", "okay", "let's go", "yep", "yeah"]):
+                self.update_state(session_id, {
+                    "ability_intake_stage": "health_status",
+                    "intake_reprompt_count": 0,
+                    "discovery_permission_granted": True,
+                    "discovery_permission_asked": True
+                })
+                return AbilityIntakeHandler.get_health_status_question()
+
+            elif any(w in msg_lower for w in ["no", "skip", "later", "not now"]):
+                # Skip ability intake - use defaults
+                profile.tier = "average"
+                profile.intake_completed = True
+                self.update_state(session_id, {
+                    "ability_profile": profile,
+                    "ability_intake_stage": None,
+                    "stage": "discovery",
+                    "goal": "protocol"
+                })
+                return (f"No problem, {state.user_name}! We'll use standard protocols.\n\n"
+                        f"Now tell me — **what's the main issue you'd like to address?**\n\n"
+                        f"{GOAL_OPTIONS}")
+            else:
+                # Re-prompt permission
+                return AbilityIntakeHandler.get_permission_message()
+        
+        # ==========================================
+        # STAGE: Health Status (checkbox selection)
+        # ==========================================
+        if intake_stage == "health_status":
+            selected_tiers = AbilityIntakeHandler.parse_health_status_response(msg)
+            
+            if selected_tiers is None:
+                if state.intake_reprompt_count >= 2:
+                    # Forced pass after 3 attempts
+                    logger.warning(f"RetryGuard: Forced health_status for {session_id}")
+                    selected_tiers = ["average"]
+                else:
+                    # Re-prompt
+                    self.update_state(session_id, {"intake_reprompt_count": state.intake_reprompt_count + 1})
+                    return "I didn't quite catch that. " + AbilityIntakeHandler.get_health_status_question()
+
+            
+            # Decouple systemic health (multiplier) from mobility (modifications)
+            has_limited_limbs = "limited_limbs" in (selected_tiers or [])
+            active_health_tiers = [t for t in (selected_tiers or []) if t != "limited_limbs"]
+            
+            # Prefer the most conservative health tier for dosage
+            tier_priority = ["cardiac_pulm", "sedentary", "pregnant", "average", "athletic"]
+            primary_tier = next((tier for tier in tier_priority if tier in active_health_tiers), "average")
+            
+            profile.tier = primary_tier
+            profile.has_limb_limitations = has_limited_limbs
+            
+            self.update_state(session_id, {
+                "ability_profile": profile,
+                "intake_reprompt_count": 0
+            })
+            
+            # Check if follow-up needed for tolerance/trimester (systemic health)
+            tier_info = ABILITY_TIERS.get(primary_tier, {})
+            if tier_info.get("needs_followup"):
+                followup_type = tier_info.get("followup_type")
+                if followup_type == "tolerance":
+                    self.update_state(session_id, {
+                        "ability_intake_stage": "tolerance_followup",
+                        "pending_ability_followup": "tolerance"
+                    })
+                    return AbilityIntakeHandler.get_tolerance_question()
+                elif followup_type == "trimester":
+                    self.update_state(session_id, {
+                        "ability_intake_stage": "trimester_followup",
+                        "pending_ability_followup": "trimester"
+                    })
+                    return AbilityIntakeHandler.get_trimester_question()
+            
+            # Always ask mobility — users who have no considerations can select "None" in one click
+            self.update_state(session_id, {"ability_intake_stage": "mobility"})
+            return AbilityIntakeHandler.get_mobility_question()
+        
+        # ==========================================
+        # STAGE: Tolerance Follow-up
+        # ==========================================
+        if intake_stage == "tolerance_followup":
+            tolerance = AbilityIntakeHandler.parse_tolerance_response(msg)
+            if tolerance or state.intake_reprompt_count >= 2:
+                if not tolerance:
+                    logger.warning(f"RetryGuard: Forced tolerance for {session_id}")
+                    tolerance = "moderate"
+                
+                profile.exercise_tolerance = tolerance
+                self.update_state(session_id, {
+                    "ability_profile": profile,
+                    "ability_intake_stage": "mobility",
+                    "pending_ability_followup": None,
+                    "intake_reprompt_count": 0
+                })
+                return AbilityIntakeHandler.get_mobility_question()
+            else:
+                # Re-prompt
+                self.update_state(session_id, {"intake_reprompt_count": state.intake_reprompt_count + 1})
+                return "I didn't quite catch that. " + AbilityIntakeHandler.get_tolerance_question()
+        
+        # ==========================================
+        # STAGE: Trimester Follow-up
+        # ==========================================
+        if intake_stage == "trimester_followup":
+            trimester = AbilityIntakeHandler.parse_trimester_response(msg)
+            if trimester or state.intake_reprompt_count >= 2:
+                if not trimester:
+                    logger.warning(f"RetryGuard: Forced trimester for {session_id}")
+                    trimester = "t2"
+                
+                profile.pregnancy_trimester = trimester
+                self.update_state(session_id, {
+                    "ability_profile": profile,
+                    "ability_intake_stage": "mobility",
+                    "pending_ability_followup": None,
+                    "intake_reprompt_count": 0
+                })
+                return AbilityIntakeHandler.get_mobility_question()
+            else:
+                self.update_state(session_id, {"intake_reprompt_count": state.intake_reprompt_count + 1})
+                return "I didn't quite catch that. " + AbilityIntakeHandler.get_trimester_question()
+        
+        # ==========================================
+        # STAGE: Mobility (checkbox selection)
+        # ==========================================
+        if intake_stage == "mobility":
+            selected_needs = AbilityIntakeHandler.parse_mobility_response(msg)
+            if selected_needs is None:
+                if state.intake_reprompt_count >= 2:
+                    logger.warning(f"RetryGuard: Forced mobility for {session_id}")
+                    selected_needs = [] # "None of the above" behavior
+                else:
+                    self.update_state(session_id, {"intake_reprompt_count": state.intake_reprompt_count + 1})
+                    return "I didn't quite catch that. " + AbilityIntakeHandler.get_mobility_question()
+            
+            # Reset counter on success
+            self.update_state(session_id, {"intake_reprompt_count": 0})
+
+            profile.accessibility_needs = selected_needs
+
+            # [REFINEMENT] If user selected "limited limbs" but picked "None" here, re-prompt
+            if profile.has_limb_limitations and not selected_needs:
+                self.update_state(session_id, {"intake_reprompt_count": state.intake_reprompt_count + 1})
+                return ("You mentioned having limited limb use earlier—could you specify which limb(s)? "
+                        "This helps me build a safer protocol for you.\n\n" + AbilityIntakeHandler.get_mobility_question())
+
+            msg_lower = msg.lower() if msg else ""
+            no_use_phrases = ["no use", "cannot use", "can't use", "unable to use", "paralyzed", "paralysed", "no movement", "no mobility"]
+            if any(p in msg_lower for p in no_use_phrases):
+                if any(w in msg_lower for w in ["arm", "arms", "hand", "hands"]):
+                    profile.accessibility_details["arms"] = {"function": "none"}
+                if any(w in msg_lower for w in ["leg", "legs", "foot", "feet"]):
+                    profile.accessibility_details["legs"] = {"function": "none"}
+
+            self.update_state(session_id, {"ability_profile": profile})
+
+            if "wheelchair" in selected_needs:
+                self.update_state(session_id, {
+                    "ability_intake_stage": "wheelchair_arms",
+                    "pending_ability_followup": "wheelchair_arms"
+                })
+                return AbilityIntakeHandler.get_wheelchair_arms_question()
+            
+            # SIDE CLARIFICATION REMOVED: Bypassing and completing intake
+            return self._complete_ability_intake(session_id)
+
+        # ==========================================
+        # STAGE: Wheelchair Arm-Use Follow-up
+        # ==========================================
+        if intake_stage == "wheelchair_arms":
+            arm_use = AbilityIntakeHandler.parse_wheelchair_arms_response(msg)
+            if arm_use or state.intake_reprompt_count >= 2:
+                if not arm_use:
+                    logger.warning(f"RetryGuard: Forced wheelchair_arms for {session_id}")
+                    arm_use = "yes"
+                
+                profile.accessibility_details["wheelchair"] = {"arm_use": arm_use}
+                if arm_use == "no":
+                    for need in ["arms", "hands"]:
+                        if need not in profile.accessibility_needs:
+                            profile.accessibility_needs.append(need)
+                    profile.accessibility_details["arms"] = {"side": "both", "function": "none"}
+                self.update_state(session_id, {
+                    "ability_profile": profile,
+                    "pending_ability_followup": None,
+                    "intake_reprompt_count": 0
+                })
+
+                # SIDE CLARIFICATION REMOVED: Competing intake immediately after wheelchair arms follow-up
+                return self._complete_ability_intake(session_id)
+            else:
+                return "I didn't quite catch that. " + AbilityIntakeHandler.get_wheelchair_arms_question()
+        
+        # SIDE CLARIFICATION STAGES REMOVED (side_arms, side_legs)
+        
+        # Fallback
+        return AbilityIntakeHandler.get_permission_message()
+    
+    def _complete_ability_intake(self, session_id: str) -> str:
+        """
+        Complete the ability intake process and transition to goal capture.
+        """
+        state = self.get_state(session_id)
+        profile = state.ability_profile
+
+        # Ensure wheelchair arm-use is captured before completing
+        if profile and "wheelchair" in profile.accessibility_needs:
+            wheelchair_details = profile.accessibility_details.get("wheelchair", {})
+            if not wheelchair_details.get("arm_use"):
+                self.update_state(session_id, {
+                    "ability_profile": profile,
+                    "ability_intake_stage": "wheelchair_arms",
+                    "pending_ability_followup": "wheelchair_arms"
+                })
+                return AbilityIntakeHandler.get_wheelchair_arms_question()
+
+        profile.intake_completed = True
+        
+        self.update_state(session_id, {
+            "ability_profile": profile,
+            "ability_intake_stage": None,
+            "pending_ability_followup": None,
+            "stage": "goal_capture",
+            "discovery_permission_granted": True,
+            "discovery_permission_asked": True
+        })
+        
+        # Save to CRM
+        if self.crm and state.user_email:
+            try:
+                self.crm.update_contact(
+                    email=state.user_email,
+                    ability_tier=profile.tier,
+                    exercise_tolerance=profile.exercise_tolerance,
+                    pregnancy_trimester=profile.pregnancy_trimester,
+                    accessibility_needs=profile.accessibility_needs,
+                    accessibility_details=profile.accessibility_details,
+                    intake_completed=True
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger("ElastiqueBot").error(f"CRM Update Failed in _complete_ability_intake: {e}")
+        
+        try:
+            return AbilityIntakeHandler.get_intake_complete_message(profile, state.user_name or "friend", GOAL_OPTIONS)
+        except Exception as e:
+            import logging
+            logging.getLogger("ElastiqueBot").error(f"Error building intake summary: {e}")
+            return "Thanks! Profile updated. Now, what's the main issue you'd like to address?"
 
     def _handle_discovery(self, session_id: str, msg: str) -> str:
         """
@@ -909,20 +1796,101 @@ class ConversationManager:
         router_conf = (router_interpreted or {}).get("confidence", "low")
         router_ok = router_conf in ("medium", "high")
 
+        # Infer accessibility constraints from free text (e.g., wheelchair, can't move legs)
+        if not state.ability_profile:
+            self.update_state(session_id, {"ability_profile": UserAbilityProfile()})
+            state = self.get_state(session_id)
+        profile = state.ability_profile
+        inferred_access, inferred_wheelchair_arm = _infer_accessibility_from_text(f"{msg} {state.extra_context or ''}")
+
+        def _build_synthetic_msg(base_msg: str) -> str:
+            msg_for_protocol = base_msg or ""
+            if len(msg_for_protocol.strip().split()) <= 2 and state.primary_region and state.context_trigger and state.timing:
+                msg_for_protocol = ""
+            if _is_negative(msg_for_protocol) and state.extra_context in ("none", None):
+                msg_for_protocol = ""
+
+            keywords = []
+            if state.primary_region == "general":
+                region_hits = (state.preferences or {}).get("region_hits", [])
+                for hit in region_hits:
+                    keywords.extend(_region_keywords(hit))
+                if not keywords:
+                    # Ensure the synthetic prompt contains enough context to avoid the
+                    # "generic greeting" guard in `_handle_diagnosis_v3` and consistently
+                    # generate a baseline (foundation) protocol for general wellness.
+                    keywords.extend(["general", "wellness", "lymphatic", "support", "swelling"])
+            else:
+                keywords.extend(_region_keywords(state.primary_region))
+            keywords.extend(_context_keywords(state.context_trigger))
+            if state.timing:
+                keywords.append(state.timing)
+            if state.extra_context and state.extra_context != "none":
+                msg_for_protocol = f"{msg_for_protocol} {state.extra_context}".strip()
+            return f"{' '.join(keywords)} {msg_for_protocol}".strip()
+        if inferred_access and profile:
+            updated = False
+            for need in inferred_access:
+                if need not in profile.accessibility_needs:
+                    profile.accessibility_needs.append(need)
+                    updated = True
+            if inferred_wheelchair_arm:
+                wheelchair_details = profile.accessibility_details.get("wheelchair", {})
+                if wheelchair_details.get("arm_use") != inferred_wheelchair_arm:
+                    wheelchair_details["arm_use"] = inferred_wheelchair_arm
+                    profile.accessibility_details["wheelchair"] = wheelchair_details
+                    updated = True
+                if inferred_wheelchair_arm == "no":
+                    for need in ["arms", "hands"]:
+                        if need not in profile.accessibility_needs:
+                            profile.accessibility_needs.append(need)
+                            updated = True
+            if updated:
+                self.update_state(session_id, {"ability_profile": profile})
+                state = self.get_state(session_id)
+
         # Last chance confirmation flow before protocol
         if state.pending_summary_details:
             self.update_state(session_id, {"extra_context": msg, "pending_summary_details": False, "pending_summary_confirmation": False})
             state = self.get_state(session_id)
-        elif state.pending_summary_confirmation:
+        
+        # ========== Two-Message PDF Generation ==========
+        # On the first turn, we show "Building your protocol now..."
+        # On the NEXT turn (any user input), we actually generate and return the PDF
+        if state.pending_pdf_generation:
+            self.update_state(session_id, {"pending_pdf_generation": False})
+            state = self.get_state(session_id)
+            synthetic_msg = _build_synthetic_msg("")
+            _ = self._handle_diagnosis_v3(session_id, synthetic_msg)
+            pdf_msg = self._handle_agreement(session_id, "yes")
+            return pdf_msg
+        
+        if state.pending_summary_confirmation:
             if _is_negative(msg):
-                self.update_state(session_id, {"pending_summary_confirmation": False})
+                # User declined to add extra context - generate PDF immediately
+                self.update_state(session_id, {"pending_summary_confirmation": False, "extra_context": "none"})
                 state = self.get_state(session_id)
+                if state.primary_region and state.context_trigger and state.timing:
+                    summary = _build_user_summary_for_protocol(state)
+                    synthetic_msg = _build_synthetic_msg("")
+                    _ = self._handle_diagnosis_v3(session_id, synthetic_msg)
+                    pdf_msg = self._handle_agreement(session_id, "yes")
+                    if summary:
+                        return f"{summary}\n\n---\n\n{pdf_msg}"
+                    return pdf_msg
             elif _is_affirmative(msg) and len(msg.strip().split()) <= 3:
                 self.update_state(session_id, {"pending_summary_details": True})
                 return "Got it. What should I consider for your protocol?"
             else:
                 self.update_state(session_id, {"extra_context": msg, "pending_summary_confirmation": False})
                 state = self.get_state(session_id)
+                summary = _build_user_summary_for_protocol(state)
+                synthetic_msg = _build_synthetic_msg("")
+                _ = self._handle_diagnosis_v3(session_id, synthetic_msg)
+                pdf_msg = self._handle_agreement(session_id, "yes")
+                if summary:
+                    return f"{summary}\n\n---\n\n{pdf_msg}"
+                return pdf_msg
 
         # Resolve pending context default question
         if state.pending_context_default:
@@ -938,38 +1906,87 @@ class ConversationManager:
 
         # Update discovery fields if missing
         if not state.primary_region:
-            region = interpreted.get("region") or extract_primary_region(msg_lower)
+            region = interpreted.get("region")
+            region_hits = interpreted.get("region_hits") or []
+            if not region or region == "unknown":
+                region = extract_primary_region(msg_lower)
             if router_ok and (not region or region == "unknown"):
                 region = router_interpreted.get("region")
             if llm_ok and (not region or region == "unknown"):
                 region = llm_interpreted.get("region")
             if region and region != "unknown":
-                self.update_state(session_id, {"primary_region": region, "last_question_key": None})
+                updates = {"primary_region": region, "last_question_key": None}
+                if region_hits:
+                    prefs = dict(state.preferences or {})
+                    prefs["region_hits"] = region_hits
+                    updates["preferences"] = prefs
+                self.update_state(session_id, updates)
+                state = self.get_state(session_id)
+                slots = dict(state.discovery_slots or {})
+                slots["primary_region"] = True
+                self.update_state(session_id, {"discovery_slots": slots})
+                state = self.get_state(session_id)
+        else:
+            region_hits = interpreted.get("region_hits") or []
+            if region_hits:
+                prefs = dict(state.preferences or {})
+                prefs["region_hits"] = region_hits
+                self.update_state(session_id, {"preferences": prefs})
                 state = self.get_state(session_id)
 
         if not state.context_trigger:
-            context = interpreted.get("context") or extract_context_trigger(msg_lower)
+            context = interpreted.get("context")
+            logger.info(f"CONTEXT DEBUG: interpreted={context} goal_key={state.goal_key}")
+
+            if not context or context == "unknown":
+                context = extract_context_trigger(msg_lower)
+                logger.info(f"CONTEXT DEBUG: extract_context_trigger={context}")
+
             if router_ok and (not context or context == "unknown"):
                 context = router_interpreted.get("context")
+                logger.info(f"CONTEXT DEBUG: router_interpreted={context}")
+
             if llm_ok and (not context or context == "unknown"):
                 context = llm_interpreted.get("context")
+                logger.info(f"CONTEXT DEBUG: llm_interpreted={context}")
+
+            # Guard: don't auto-infer "pregnancy" if the user explicitly chose a different goal
+            if context == "pregnancy" and state.goal_key and state.goal_key != "pregnancy":
+                logger.info(f"CONTEXT DEBUG: BLOCKING FALSE PREGNANCY. Goal is {state.goal_key}")
+                context = None
+            
             if context and context != "unknown":
                 self.update_state(session_id, {"context_trigger": context, "last_question_key": None})
                 state = self.get_state(session_id)
+                slots = dict(state.discovery_slots or {})
+                slots["context_trigger"] = True
+                self.update_state(session_id, {"discovery_slots": slots})
+                state = self.get_state(session_id)
 
         # Permission gate (ask once before discovery questions)
+        # IMPLICIT PERMISSION: If user already provided symptom info, skip the permission question
         if not state.discovery_permission_granted:
-            if not state.discovery_permission_asked:
+            # Grant implicit permission if user provided any symptom data proactively
+            if state.primary_region or state.context_trigger or state.timing:
+                self.update_state(session_id, {"discovery_permission_granted": True, "discovery_permission_asked": True})
+            elif not state.discovery_permission_asked:
                 self.update_state(session_id, {"discovery_permission_asked": True})
                 empathy = _discovery_empathy(msg)
                 return (f"{empathy}\n\n"
-                        "To build a **targeted lymphatic wellness guide**, would it be okay if I ask **4 to 5 quick questions**?")
+                        "To build a **targeted lymphatic wellness guide**, would it be okay if I ask **4 to 5 quick questions**?\n\n"
+                        "○ Yes, let's go!\n"
+                        "○ No thanks")
             # If user answered, handle yes/no
             if _is_affirmative(msg):
                 self.update_state(session_id, {"discovery_permission_granted": True})
             elif _is_negative(msg):
-                return ("No problem. When you’re ready, tell me the **main area** you want help with and your **primary goal**, "
-                        "and I’ll keep it brief.")
+                return ("No problem. When you’re ready, tell me the **main concern** you want help with:\n\n"
+                        "○ Swelling or heaviness\n"
+                        "○ Post-surgery recovery\n"
+                        "○ Smoother, firmer-looking skin\n"
+                        "○ Exercise recovery\n"
+                        "○ Pregnancy comfort\n"
+                        "○ General wellness")
 
         if state.context_trigger and not state.timing:
             timing = interpreted.get("timing") or extract_timing(msg_lower)
@@ -980,18 +1997,42 @@ class ConversationManager:
             if timing and timing != "unknown":
                 self.update_state(session_id, {"timing": timing, "last_question_key": None})
                 state = self.get_state(session_id)
+                slots = dict(state.discovery_slots or {})
+                slots["timing"] = True
+                self.update_state(session_id, {"discovery_slots": slots})
+                state = self.get_state(session_id)
 
         # Capture constraints early if present
         if router_ok and router_interpreted.get("constraints") and not state.extra_context:
-            self.update_state(session_id, {"extra_context": router_interpreted.get("constraints")})
+            if not _is_constraint_noise(router_interpreted.get("constraints")):
+                self.update_state(session_id, {"extra_context": router_interpreted.get("constraints")})
             state = self.get_state(session_id)
         if llm_ok and llm_interpreted.get("constraints") and not state.extra_context:
-            self.update_state(session_id, {"extra_context": llm_interpreted.get("constraints")})
+            if not _is_constraint_noise(llm_interpreted.get("constraints")):
+                self.update_state(session_id, {"extra_context": llm_interpreted.get("constraints")})
             state = self.get_state(session_id)
 
         # If user provided context before explicit consent, treat it as implicit consent
         if not state.discovery_permission_granted and state.discovery_permission_asked and (state.primary_region or state.context_trigger or state.timing):
             self.update_state(session_id, {"discovery_permission_granted": True})
+
+        if not state.primary_region:
+            # Map numeric option-button selections to region values
+            _REGION_OPTION_MAP = {
+                "1": "legs",      # Legs & feet
+                "2": "arms",      # Arms & hands
+                "3": "face",      # Face & neck
+                "4": "abdomen",   # Abdomen & core
+                "5": "general",   # Multiple areas / whole body
+            }
+            region_from_btn = _REGION_OPTION_MAP.get(msg.strip())
+            if region_from_btn:
+                self.update_state(session_id, {"primary_region": region_from_btn, "last_question_key": None})
+                state = self.get_state(session_id)
+                slots = dict(state.discovery_slots or {})
+                slots["primary_region"] = True
+                self.update_state(session_id, {"discovery_slots": slots})
+                state = self.get_state(session_id)
 
         if not state.primary_region:
             empathy = _discovery_empathy(msg)
@@ -1004,14 +2045,64 @@ class ConversationManager:
                 state = self.get_state(session_id)
             else:
                 if attempts >= 1 or _is_repeat_frustration(msg) or interpreted.get("uncertain_region") or _is_uncertain(msg):
-                    question = ("If you already told me, I may have missed it. "
-                                "You can say **legs and feet**, **arms and hands**, **face and neck**, "
-                                "**abdomen and core**, or **multiple areas**.")
+                    question = ("If you already told me, I may have missed it.\n\n"
+                                "○ Legs & feet\n"
+                                "○ Arms & hands\n"
+                                "○ Face & neck\n"
+                                "○ Abdomen & core\n"
+                                "○ Multiple areas / whole body")
                 else:
-                    question = "Where in your body is the swelling or heaviness most noticeable?"
-                reason = "That helps me target the right lymphatic pathways."
-                self.update_state(session_id, _record_question(state, "region"))
-                return f"{empathy}\n\n{reason}\n\n{question}"
+                    # FIRST ATTEMPT: If user gave ANY substantive response (3+ words or contains keywords), 
+                    # treat it as valid "general" wellness and proceed
+                    words = msg.strip().split()
+                    has_wellness_intent = any(w in msg_lower for w in ["pregnant", "pregnancy", "healthy", "wellness", "health", "better", "just", "want"])
+                    if len(words) >= 3 or has_wellness_intent:
+                        # Accept their response as general wellness context
+                        self.update_state(session_id, {
+                            "primary_region": "general",
+                            "context_trigger": "daily",
+                            "extra_context": msg,
+                            "last_question_key": None
+                        })
+                        state = self.get_state(session_id)
+                    else:
+                        goal_key = state.goal_key or "wellness"
+                        descriptor = _GOAL_DESCRIPTORS.get(goal_key, "swelling or heaviness")
+                        
+                        if goal_key == "wellness":
+                            question_text = "Where in your body would you like to focus your wellness routine?"
+                        else:
+                            question_text = f"Where in your body is the {descriptor} most noticeable?"
+
+                        question = (f"{question_text}\n\n"
+                                    "○ Legs & feet\n"
+                                    "○ Arms & hands\n"
+                                    "○ Face & neck\n"
+                                    "○ Abdomen & core\n"
+                                    "○ Multiple areas / whole body")
+                        reason = "That helps me target the right lymphatic pathways."
+                        self.update_state(session_id, _record_question(state, "region"))
+                        return f"{empathy}\n\n{reason}\n\n{question}"
+
+
+        if not state.context_trigger:
+            # Map numeric option-button selections to context values
+            _CONTEXT_OPTION_MAP = {
+                "1": "surgery",    # After surgery
+                "2": "travel",     # Travel / flights
+                "3": "training",   # Workouts / training
+                "4": "heat",       # Heat / weather
+                "5": "pregnancy",  # Pregnancy
+                "6": "daily",      # Daily / ongoing
+            }
+            context_from_btn = _CONTEXT_OPTION_MAP.get(msg.strip())
+            if context_from_btn:
+                self.update_state(session_id, {"context_trigger": context_from_btn, "last_question_key": None})
+                state = self.get_state(session_id)
+                slots = dict(state.discovery_slots or {})
+                slots["context_trigger"] = True
+                self.update_state(session_id, {"discovery_slots": slots})
+                state = self.get_state(session_id)
 
         if not state.context_trigger:
             empathy = _discovery_empathy(msg)
@@ -1024,18 +2115,47 @@ class ConversationManager:
                     self.update_state(session_id, {"pending_context_default": True})
                     self.update_state(session_id, _record_question(state, "context"))
                     return ("No problem. If you are unsure, we can treat this as **daily** for now. "
-                            "Does that feel accurate?")
+                            "Does that feel accurate?\n\n"
+                            "○ Yes, that's fine\n"
+                            "○ No, let's try again")
             if not state.context_trigger:
                 if attempts >= 1:
-                    question = ("If none of these fit, you can say **daily** and we will keep it simple. "
-                                "Which sounds closest: **surgery**, **travel**, **workouts**, **heat**, **pregnancy**, "
-                                "or **daily**?")
+                    question = ("If none of these fit, just pick **Daily / ongoing**.\n\n"
+                                "○ After surgery\n"
+                                "○ Travel / flights\n"
+                                "○ Workouts / training\n"
+                                "○ Heat / weather\n"
+                                "○ Pregnancy\n"
+                                "○ Daily / ongoing")
                 else:
-                    question = ("Did this start after **surgery**, **travel**, **workouts**, **heat**, **pregnancy**, "
-                                "or is it more of a **daily** issue?")
+                    question = ("Did this start after something specific, or is it more of an ongoing thing?\n\n"
+                                "○ After surgery\n"
+                                "○ Travel / flights\n"
+                                "○ Workouts / training\n"
+                                "○ Heat / weather\n"
+                                "○ Pregnancy\n"
+                                "○ Daily / ongoing")
                 reason = "The trigger changes which protocol is safest and most effective."
                 self.update_state(session_id, _record_question(state, "context"))
                 return f"{empathy}\n\n{reason}\n\n{question}"
+
+        if not state.timing:
+            # Map numeric option-button selections to timing values
+            _TIMING_OPTION_MAP = {
+                "1": "morning",    # Morning
+                "2": "afternoon",  # Afternoon
+                "3": "evening",    # Evening
+                "4": "all_day",    # All day / constant
+                "5": "on_and_off", # On and off
+            }
+            timing_from_btn = _TIMING_OPTION_MAP.get(msg.strip())
+            if timing_from_btn:
+                self.update_state(session_id, {"timing": timing_from_btn, "last_question_key": None})
+                state = self.get_state(session_id)
+                slots = dict(state.discovery_slots or {})
+                slots["timing"] = True
+                self.update_state(session_id, {"discovery_slots": slots})
+                state = self.get_state(session_id)
 
         if not state.timing:
             empathy = _discovery_empathy(msg)
@@ -1045,57 +2165,109 @@ class ConversationManager:
                 state = self.get_state(session_id)
             else:
                 if attempts >= 1 or _is_repeat_frustration(msg) or interpreted.get("uncertain_timing") or _is_uncertain(msg):
-                    question = ("If it varies or feels constant, you can say **all day** or **on and off**. "
-                                "Otherwise, which is most true, **morning**, **afternoon**, or **evening**?")
+                    question = ("If it varies or feels constant, pick **All day** or **On and off**.\n\n"
+                                "○ Morning\n"
+                                "○ Afternoon\n"
+                                "○ Evening\n"
+                                "○ All day / constant\n"
+                                "○ On and off")
                 else:
-                    question = "When does it feel worst, **morning**, **afternoon**, or **evening**?"
+                    goal_key = state.goal_key or "wellness"
+                    if goal_key == "wellness":
+                        question_text = "When would you like to perform your routine for the best results?"
+                    else:
+                        question_text = "When does it tend to feel worst?"
+
+                    question = (f"{question_text}\n\n"
+                                "○ Morning\n"
+                                "○ Afternoon\n"
+                                "○ Evening\n"
+                                "○ All day / constant\n"
+                                "○ On and off")
                 reason = "Timing helps me sequence your routine for the biggest relief."
                 self.update_state(session_id, _record_question(state, "timing"))
                 return f"{empathy}\n\n{reason}\n\n{question}"
 
-        # All required fields collected. Offer final confirmation once.
-        if state.primary_region and state.context_trigger and state.timing and not state.pending_summary_confirmation and not state.extra_context:
-            self.update_state(session_id, {"pending_summary_confirmation": True})
-            summary = _build_user_summary(state)
+
+        # All required fields collected. Generate PDF and return formatted two-part message.
+        if state.primary_region and state.context_trigger and state.timing and not state.pending_summary_confirmation:
+            summary = _build_user_summary_for_protocol(state)
+            
+            # Build protocol silently
+            synthetic_msg = _build_synthetic_msg("")
+            _ = self._handle_diagnosis_v3(session_id, synthetic_msg)
+            
+            # REFRESH STATE: ensure we have protocol_items from silent build
+            state = self.get_state(session_id)
+            
+            # Generate PDF
+            pdf_msg = self._handle_agreement(session_id, "yes")
+            
+            # Return formatted two-part message
             if summary:
-                return f"{summary} Before I build your protocol, is there anything you want me to consider like injuries, schedule, or constraints?"
-            return "Before I build your protocol, is there anything you want me to consider like injuries, schedule, or constraints?"
+                return f"{summary}\n\n---\n\n{pdf_msg}"
+            return pdf_msg
 
         # All required fields collected -> generate protocol
-        keywords = []
-        keywords.extend(_region_keywords(state.primary_region))
-        keywords.extend(_context_keywords(state.context_trigger))
-        if state.timing:
-            keywords.append(state.timing)
-        if state.extra_context:
-            msg = f"{msg} {state.extra_context}"
-        synthetic_msg = f"{' '.join(keywords)} {msg}".strip()
+        synthetic_msg = _build_synthetic_msg(msg)
         return self._handle_diagnosis_v3(session_id, synthetic_msg)
 
     def _handle_agreement(self, session_id, msg):
+        """
+        Handle protocol agreement/modification flow.
+        Now supports ACTUAL modifications via RefinementEngine.
+        """
         msg_lower = msg.lower()
+        state = self.get_state(session_id)
+        
+        # --- Initialize RefinementEngine ---
+        refinement_engine = RefinementEngine()
+        
+        # --- Affirmative Keywords (Final Acceptance) ---
         affirmative_keywords = [
             "yes", "sure", "ok", "okay", "great", "sounds good", "please",
-            "protocol", "routine", "generate", "pdf", "send"
+            "protocol", "routine", "generate", "pdf", "send", "perfect", "love it",
+            "looks good", "that works", "let's do it", "i'm ready", "ready"
         ]
-        router = self.decision_router.interpret_agreement(msg) if self.decision_router else {}
-        router_conf = (router or {}).get("confidence", "low")
-        router_decision = (router or {}).get("decision")
-        router_constraints = (router or {}).get("constraints")
+        
+        # --- Modification Keywords (User wants to change something) ---
+        modification_keywords = [
+            "less", "fewer", "reduce", "shorter", "easier", "simpler",
+            "more", "harder", "longer", "intense", "increase",
+            "change", "modify", "adjust", "can we", "could we",
+            "too much", "too hard", "too long", "not sure", "busy",
+            "time", "reps", "sets", "minutes", "days", "dose", "intensity", "timing"
+        ]
+        
+        # --- Check for pure affirmative (no modification words) ---
+        has_affirmative = any(w in msg_lower for w in affirmative_keywords)
+        has_modification = any(w in msg_lower for w in modification_keywords)
 
-        if router_conf in ("medium", "high") and router_constraints:
-            self.update_state(session_id, {"extra_context": router_constraints})
-
-        if router_conf in ("medium", "high") and router_decision in ("modify", "unsure", "question", "decline"):
-            self.update_state(session_id, {"refinement_count": self.get_state(session_id).refinement_count + 1})
-            if router_decision == "question":
-                return ("Great question. What part would you like clarified or adjusted so it feels realistic for you?")
-            return ("Understood. What would you like to adjust in the routine, intensity, or timing? "
-                    "I can tailor it to fit your day.")
-
-        if any(w in msg_lower for w in affirmative_keywords):
-            state = self.get_state(session_id)
+        # Explicit acceptance phrases that include modification keywords
+        explicit_acceptance = bool(re.search(
+            r"\b(no (change|changes|adjustment|adjustments|modification|mods|tweaks)|no need to change|keep it as is|"
+            r"fine as is|looks good|all set|no changes needed|no adjustments needed)\b",
+            msg_lower
+        ))
+        if explicit_acceptance:
+            has_affirmative = True
+            has_modification = False
+        
+        # If pure affirmative -> generate PDF
+        if has_affirmative and not has_modification:
             protocol_items = state.protocol_items or []
+            
+            # Emergency fallback: if empty, try to populate from Foundation
+            if not protocol_items:
+                logger.warning(f"Empty protocol_items for {session_id}. Injecting Foundation fallback.")
+                from services.clinical_library import CLINICAL_PROTOCOLS
+                foundation = CLINICAL_PROTOCOLS.get("foundation", {})
+                raw_items = foundation.get("items", [])
+                for it in raw_items:
+                    protocol_items.append({"action": it.get("name"), "details": it.get("dose") or it.get("instruction")})
+                self.update_state(session_id, {"protocol_items": protocol_items, "agreed_protocol": ["Whole-Body Foundation Stack"]})
+                state = self.get_state(session_id)
+
             title = state.agreed_protocol[0] if state.agreed_protocol else "Your Lymphatic Wellness Focus"
             user_name = state.user_name or "Valued Client"
             pdf_path = None
@@ -1106,33 +2278,193 @@ class ConversationManager:
                     root_cause=title,
                     daily_items=protocol_items,
                     weekly_items=[],
-                    email=state.user_email
+                    email=state.user_email,
+                    profile={
+                        "goal_key": state.goal_key or "wellness",
+                        "primary_region": state.primary_region or "general",
+                        "context_trigger": state.context_trigger or "",
+                        "health_status": state.ability_profile.tier if state.ability_profile else "average",
+                        "exercise_tolerance": state.ability_profile.exercise_tolerance if state.ability_profile else None,
+                        "pregnancy_trimester": state.ability_profile.pregnancy_trimester if state.ability_profile else None,
+                        "mobility": state.ability_profile.accessibility_needs if state.ability_profile else [],
+                        "accessibility_details": state.ability_profile.accessibility_details if state.ability_profile else {},
+                    },
+                    citations=[url for item in protocol_items for url in (item.get("urls") or [])]
                 )
             except Exception:
                 pdf_path = None
             pdf_url = None
             if pdf_path:
                 filename = os.path.basename(pdf_path)
-                pdf_url = f"/static/protocols/{filename}"
+                pdf_url = f"{BACKEND_URL}/static/protocols/{filename}"
             self.update_state(session_id, {"stage": "fork"})
-            if pdf_url:
-                return ("Fantastic. Your personalized protocol PDF is ready.\n\n"
-                        f"[Download your protocol]({pdf_url})\n\n"
-                        "Would you like to see **Clinical Garments** that support this protocol or schedule a **Consultation**?")
-            return ("Fantastic. I am preparing your personalized protocol now.\n\n"
-                    "Would you like to see **Clinical Garments** that support this protocol or schedule a **Consultation**?")
-        
-        # Handle objections or modification requests and stay in agreement
-        if any(w in msg_lower for w in ["no", "cant", "can't", "hard", "difficult", "change", "modify", "adjust", "too much", "too hard", "too long", "not sure", "unsure"]):
-            self.update_state(session_id, {"refinement_count": self.get_state(session_id).refinement_count + 1})
-            return ("Understood. What would you like to adjust in the routine, intensity, or timing? "
-                    "I can tailor it to fit your day.")
-        
-        if "?" in msg:
-            return ("Great question. What part would you like clarified or adjusted so it feels realistic for you?")
+            
+            # Build protocol summary for CRM and returning user context
+            protocol_summary = None
+            if protocol_items:
+                item_names = [item.get("action", "Unknown") for item in protocol_items[:3]]
+                if len(protocol_items) > 3:
+                    protocol_summary = f"{title} protocol: {', '.join(item_names)} and {len(protocol_items) - 3} more exercises"
+                else:
+                    protocol_summary = f"{title} protocol: {', '.join(item_names)}"
+            else:
+                protocol_summary = f"{title} protocol"
+            
+            # Save to CRM for smart returning user context
+            if self.crm and pdf_url and protocol_summary:
+                try:
+                    self.crm.update_conversation_protocol(session_id, pdf_url, protocol_summary)
+                except Exception as e:
+                    logger.error(f"CRM Protocol Update Failed: {e}")
+            
+            logger.info(f"PDF GENERATION DEBUG: pdf_path={pdf_path} pdf_url={pdf_url} user_name={user_name}")
 
-        # Fallback keeps the agreement loop
-        return ("Thanks for sharing. What would make this routine feel doable for you so we can lock it in?")
+            if pdf_url:
+                return ("Fantastic! Your personalized protocol PDF is ready. \n\n"
+                        f"[Download your protocol]({pdf_url})\n\n"
+                        f"What would you like to do next?\n\n"
+                        f"{FORK_OPTIONS}")
+            return ("Fantastic! I've prepared your personalized protocol.\n\n"
+                    f"What would you like to do next?\n\n"
+                    f"{FORK_OPTIONS}")
+        
+        # --- Handle Modification Request ---
+        if has_modification:
+            # Load or create ActiveProtocol
+            active_protocol = None
+            if state.active_protocol_data:
+                try:
+                    active_protocol = ActiveProtocol.from_dict(state.active_protocol_data)
+                except Exception:
+                    active_protocol = None
+            
+            # If no active protocol, create from library based on current context
+            if not active_protocol:
+                # Determine protocol key from context
+                protocol_key = "foundation"
+                if state.primary_region:
+                    region = state.primary_region.lower()
+                    if any(w in region for w in ["leg", "ankle", "foot", "feet", "calf"]):
+                        protocol_key = "legs"
+                    elif any(w in region for w in ["arm", "hand", "finger"]):
+                        protocol_key = "arms"
+                    elif any(w in region for w in ["neck", "face", "head"]):
+                        protocol_key = "neck"
+                if state.context_trigger and any(w in state.context_trigger.lower() for w in ["surgery", "post-op", "lipo"]):
+                    protocol_key = "post_op"
+                
+                active_protocol = create_active_protocol_from_library(protocol_key, CLINICAL_PROTOCOLS)
+            
+            if active_protocol:
+                # Apply modification
+                modified_protocol, change_explanation = refinement_engine.apply_modification(
+                    active_protocol, msg
+                )
+                
+                # Save updated protocol to state
+                self.update_state(session_id, {
+                    "active_protocol_data": modified_protocol.to_dict(),
+                    "refinement_count": state.refinement_count + 1
+                })
+                
+                # Re-render the updated protocol
+                updated_display = refinement_engine.render_protocol(modified_protocol)
+                
+                return (f"{change_explanation}\n\n"
+                        f"{updated_display}\n\n"
+                        "Does this feel more realistic?\n\n"
+                        "○ Yes, looks good!\n"
+                        "○ I'd like to adjust more")
+            else:
+                # Fallback if we couldn't load protocol
+                self.update_state(session_id, {"refinement_count": state.refinement_count + 1})
+                return ("Understood. What specifically would you like to adjust?\n\n"
+                        "○ Make it shorter\n"
+                        "○ Make it easier\n"
+                        "○ Make it harder")
+        
+        # --- Handle Questions ---
+        if "?" in msg:
+            return ("Great question! What would you like me to clarify?\n\n"
+                    "○ Explain an exercise\n"
+                    "○ Why does this help?\n"
+                    "○ Adjust the routine")
+        
+        # --- Fallback (prompt for specific modification or acceptance) ---
+        return ("I want to make sure this works for you. "
+                "Would you like to adjust **time**, **intensity**, or **frequency**? "
+                "Or if it looks good, just click **Looks good** to finalize!\n\n"
+                "○ Yes, looks good!\n"
+                "○ Make it shorter\n"
+                "○ Make it easier\n"
+                "○ Make it harder")
 
     def _handle_fork(self, session_id, msg):
-        return "Would you prefer to look at **Clothing** options or a **Consultation**?"
+        """Handle post-PDF fork: route to products, consultation, or gracefully end."""
+        msg_lower = (msg or "").lower()
+        state = self.get_state(session_id)
+        
+        # "I'm all set" / exit
+        exit_keywords = ["all set", "thank", "bye", "done", "no", "nothing", "that's it"]
+        if any(w in msg_lower for w in exit_keywords):
+            self.update_state(session_id, {"stage": "complete"})
+            return ("It was wonderful helping you today! Your protocol is saved and ready to download anytime.\n\n"
+                    "Explore more at [elastiqueathletics.com](https://www.elastiqueathletics.com)! 😊")
+        
+        # User wants to see products
+        product_keywords = ["clothing", "clothes", "garment", "compression", "wear", "legging", 
+                           "product", "shop", "buy", "browse", "show me"]
+        if any(w in msg_lower for w in product_keywords) or msg.strip() == "1":
+            # --- PATH-AWARE PRODUCT RECOMMENDATIONS ---
+            # Translate state fields to PATH_TO_PRODUCTS keys
+            _REGION_TO_AREA = {
+                "legs": "legs", "arms": "arms", "face": "face",
+                "abdomen": "tummy", "general": "all", "neck": "face",
+            }
+            goal_key = state.goal_key or "wellness"
+            q2_area = _REGION_TO_AREA.get(state.primary_region or "general", "all")
+            q3_context = state.context_trigger or ""
+            
+            path_result = get_products_for_path(goal_key, q2_area, q3_context)
+            primary_key = path_result.get("primary")
+            complement_key = path_result.get("complement")
+            
+            primary = PRODUCT_CATALOG.get(primary_key) if primary_key else None
+            complement = PRODUCT_CATALOG.get(complement_key) if complement_key else None
+            
+            self.update_state(session_id, {"stage": "complete"})
+            
+            # Build product recommendation message
+            parts = ["Great choice! Based on your wellness goals, here are my top picks:\n"]
+            
+            if primary:
+                parts.append(f"**Primary: {primary['name']}**")
+                parts.append(f"> *{primary['mechanism']}*")
+                parts.append(f"[View Product]({primary['url']})\n")
+            
+            if complement:
+                parts.append(f"**Also pairs well: {complement['name']}**")
+                parts.append(f"> *{complement['mechanism']}*")
+                parts.append(f"[View Product]({complement['url']})\n")
+            
+            if not primary and not complement:
+                parts.append("You can explore the full collection at ")
+                parts.append("[elastiqueathletics.com](https://www.elastiqueathletics.com)")
+            
+            parts.append("\nExplore more at [elastiqueathletics.com](https://www.elastiqueathletics.com)! 😊")
+            return "\n".join(parts)
+        
+        # User wants a consultation
+        consult_keywords = ["consult", "appointment", "book", "schedule", "call", "talk", "speak"]
+        if any(w in msg_lower for w in consult_keywords) or msg.strip() == "2":
+            self.update_state(session_id, {"stage": "complete"})
+            return ("I'd love to connect you with our team!\n\n"
+                    "You can book a consultation at "
+                    "[elastiqueathletics.com/pages/contact-us](https://www.elastiqueathletics.com/pages/contact-us)\n\n"
+                    "Explore more at [elastiqueathletics.com](https://www.elastiqueathletics.com)! 😊")
+
+        
+        # Any other response → offer final options before exit
+        return ("It was great chatting with you! Your protocol is saved and ready to download anytime.\n\n"
+                "Is there anything else I can help with?\n\n"
+                f"{FORK_OPTIONS}")
