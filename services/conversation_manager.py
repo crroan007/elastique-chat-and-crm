@@ -54,6 +54,7 @@ GOAL_OPTIONS = (
     "○ Smoother, firmer-looking skin\n"
     "○ Exercise recovery\n"
     "○ Pregnancy comfort\n"
+    "○ Travel comfort\n"
     "○ General wellness"
 )
 
@@ -63,6 +64,7 @@ _GOAL_DESCRIPTORS = {
     "skin": "skin concerns",
     "recovery": "exercise recovery",
     "pregnancy": "pregnancy discomfort",
+    "travel": "travel comfort",
     "wellness": "general wellness"
 }
 
@@ -302,7 +304,8 @@ def detect_goal(text: str) -> Optional[str]:
         return "consult"
     if any(k in t for k in ["shop", "buy", "purchase", "products", "leggings", "bra", "tank", "clothing"]):
         return "shop"
-    if any(k in t for k in ["protocol", "routine", "help", "support", "wellness", "swelling", "pain", "recovery", "skin", "cellulite", "texture", "smoother", "firmer", "dimple"]):
+    if any(k in t for k in ["protocol", "routine", "help", "support", "wellness", "swelling", "pain", "recovery", "skin", "cellulite", "texture", "smoother", "firmer", "dimple",
+                             "travel", "flight", "comfort", "flying", "airplane", "pregnancy", "pregnant"]):
         return "protocol"
     return None
 
@@ -968,31 +971,35 @@ class ConversationManager:
 
                 email_extracted = email_part
                 
-                # We have BOTH Name and Email. Proceed to ability intake.
-                # Persist contact and start ability intake
+                # We have BOTH Name and Email. Proceed to goal capture FIRST.
                 self.update_state(session_id, {
-                    "stage": "ability_intake",
-                    "ability_intake_stage": "permission",
+                    "stage": "goal_capture",
                     "user_email": email_part,
                     "user_name": name_part
                 })
                 if self.crm:
                     self.crm.create_or_update_contact(email=email_part, first_name=name_part)
-                
-                # If they already described symptoms, skip ability intake and go to discovery
-                is_diagnosis_keyword = any(w in user_msg.lower() for w in ["swelling", "ankle", "leg", "surgery", "post op", "post-op", "lipo", "recovery", "hurt", "pain"])
+
+                # If they already described symptoms (beyond just name/email), infer goal and skip to health questions
+                # Strip out the email to avoid false matches on email addresses like "travel@test.com"
+                msg_without_email = user_msg.lower().replace(email_part.lower(), "") if email_part else user_msg.lower()
+                is_diagnosis_keyword = any(w in msg_without_email for w in ["swelling", "ankle", "surgery", "post op", "post-op", "lipo", "hurt", "pain"])
                 if is_diagnosis_keyword:
-                    # Create default ability profile and go straight to discovery
                     self.update_state(session_id, {
                         "goal": "protocol",
-                        "stage": "discovery",
-                        "ability_profile": UserAbilityProfile(tier="average", intake_completed=True)
+                        "stage": "ability_intake",
+                        "ability_intake_stage": "health_status",
+                        "discovery_permission_asked": True,
+                        "discovery_permission_granted": True,
                     })
-                    response = f"Thanks {name_part}! I've saved your profile. {self._handle_discovery(session_id, user_msg)}"
+                    response = (f"Thanks {name_part}! I've saved your profile.\n\n"
+                                f"To make sure your protocol is perfectly tailored, I have a few quick questions.\n\n"
+                                f"{AbilityIntakeHandler.get_health_status_question()}")
                     return await self._finalize_response(session_id, user_msg, response)
 
-                # Start ability intake with permission message
-                response = f"Thanks {name_part}! I've saved your profile.\n\n{AbilityIntakeHandler.get_permission_message()}"
+                # Ask goal question first
+                response = (f"Thanks {name_part}! Let's build your personalized lymphatic wellness protocol.\n\n"
+                            f"What's the main concern you'd like to address or goal you are looking to meet?\n\n{GOAL_OPTIONS}")
                 return await self._finalize_response(session_id, user_msg, response)
 
             # If message contains '@' but no valid email match, prompt for a valid email
@@ -1077,12 +1084,19 @@ class ConversationManager:
                 "3": {"text": "cellulite skin",        "key": "skin"},
                 "4": {"text": "recovery training",     "key": "recovery"},
                 "5": {"text": "pregnancy",             "key": "pregnancy"},
-                "6": {"text": "general wellness",      "key": "wellness"},
+                "6": {"text": "travel flight comfort",  "key": "travel"},
+                "7": {"text": "general wellness",      "key": "wellness"},
             }
             goal_entry = _GOAL_OPTION_MAP.get(user_msg.strip())
             if goal_entry:
                 effective_msg = goal_entry["text"]
-                self.update_state(session_id, {"goal_key": goal_entry["key"]})
+                updates = {"goal_key": goal_entry["key"]}
+                # Pre-set context_trigger for goals that imply a specific trigger
+                if goal_entry["key"] == "travel":
+                    updates["context_trigger"] = "travel"
+                elif goal_entry["key"] == "pregnancy":
+                    updates["context_trigger"] = "pregnancy"
+                self.update_state(session_id, updates)
             else:
                 effective_msg = user_msg
                 # Infer goal_key from free-text
@@ -1092,12 +1106,18 @@ class ConversationManager:
                     "skin": ["cellulite", "skin", "texture", "firmer", "smoother", "dimpling"],
                     "recovery": ["recovery", "training", "workout", "exercise", "sport", "athlete", "running"],
                     "pregnancy": ["pregnant", "pregnancy", "expecting", "trimester", "postpartum"],
+                    "travel": ["travel", "flight", "flying", "airplane", "plane", "air travel", "jet lag", "long haul"],
                     "wellness": ["wellness", "general", "maintenance", "healthy", "prevention"],
                 }
                 msg_l = effective_msg.lower()
                 for gk, keywords in _TEXT_TO_KEY.items():
                     if any(w in msg_l for w in keywords):
-                        self.update_state(session_id, {"goal_key": gk})
+                        updates = {"goal_key": gk}
+                        if gk == "travel":
+                            updates["context_trigger"] = "travel"
+                        elif gk == "pregnancy":
+                            updates["context_trigger"] = "pregnancy"
+                        self.update_state(session_id, updates)
                         break
 
             goal = detect_goal(effective_msg)
@@ -1119,23 +1139,37 @@ class ConversationManager:
                 return await self._finalize_response(session_id, user_msg, response)
 
             # goal_key was already set above from _GOAL_OPTION_MAP or text inference
-            self.update_state(session_id, {"goal": goal, "stage": "discovery"})
+            # After goal capture, move to ability intake (health/mobility questions)
+            self.update_state(session_id, {
+                "goal": goal,
+                "stage": "ability_intake",
+                "ability_intake_stage": "permission",
+            })
 
             if goal == "consult":
+                self.update_state(session_id, {"stage": "consult"})
                 response = ("Wonderful. To get you set up, may I have your **best phone number** "
                             "for our specialist to call?")
                 return await self._finalize_response(session_id, user_msg, response)
 
-            # Protocol or Shopping intent flows into discovery
+            # Protocol or Shopping intent → go straight to health status (skip permission)
             if goal == "protocol" or goal_key:
-                # If we have a goal_key but detect_goal returned None, force goal to protocol
                 if not goal and goal_key:
                     goal = "protocol"
-                    self.update_state(session_id, {"goal": goal, "stage": "discovery"})
-                
-                response = self._handle_discovery(session_id, user_msg)
+                self.update_state(session_id, {
+                    "goal": goal,
+                    "stage": "ability_intake",
+                    "ability_intake_stage": "health_status",
+                    "discovery_permission_asked": True,
+                    "discovery_permission_granted": True,
+                })
+                state = self.get_state(session_id)  # refresh after update
+                goal_desc = _GOAL_DESCRIPTORS.get(state.goal_key, "your concern")
+                response = (f"Great \u2014 let's build your **{goal_desc}** protocol.\n\n"
+                            f"To make sure it's perfectly tailored, I have a few quick questions.\n\n"
+                            f"{AbilityIntakeHandler.get_health_status_question()}")
                 return await self._finalize_response(session_id, user_msg, response)
-            
+
             return await self._finalize_response(session_id, user_msg, "I'm not sure I understood that. Could you clarify your goal?")
 
         if stage == "discovery":
@@ -1748,12 +1782,12 @@ class ConversationManager:
                 return AbilityIntakeHandler.get_wheelchair_arms_question()
 
         profile.intake_completed = True
-        
+
         self.update_state(session_id, {
             "ability_profile": profile,
             "ability_intake_stage": None,
             "pending_ability_followup": None,
-            "stage": "goal_capture",
+            "stage": "discovery",
             "discovery_permission_granted": True,
             "discovery_permission_asked": True
         })

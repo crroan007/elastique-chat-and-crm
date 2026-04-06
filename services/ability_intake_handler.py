@@ -248,8 +248,8 @@ class AbilityIntakeHandler:
 
     @staticmethod
     def parse_tolerance_response(msg: str) -> Optional[str]:
-        """Parse exercise tolerance selection."""
-        return parse_selection(msg, TOLERANCE_OPTIONS, mode="single", none_id="none")
+        """Parse exercise tolerance selection. All options are valid (including 'none' = zero capacity)."""
+        return parse_selection(msg, TOLERANCE_OPTIONS, mode="single")
 
 
     @staticmethod
@@ -348,13 +348,12 @@ class AbilityIntakeHandler:
     def get_intake_complete_message(profile: UserAbilityProfile, user_name: str, goal_options: str = "") -> str:
         """
         Message shown when ability intake is complete.
-        Summarizes profile and transitions to goal/symptom discovery.
+        Summarizes profile and transitions to discovery.
         """
         summary = AbilityIntakeHandler.build_profile_summary(profile)
 
         return (
             f"Thanks {user_name}! Here's your profile:\n\n"
             f"{summary}\n\n"
-            f"Now tell me — **what's the main issue you'd like to address?**\n\n"
-            f"{goal_options}"
+            f"Now let's dig into the details so I can build your personalized protocol."
         )
