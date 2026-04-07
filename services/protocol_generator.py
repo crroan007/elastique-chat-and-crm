@@ -959,7 +959,7 @@ class ProtocolGenerator:
                 "the best sense of comfort throughout your day.",
                 answer_style
             ))
-        if ctx_trigger == "post_op" or health_status == "cardiac_pulm":
+        if ctx_trigger in ("post_op", "surgery") or health_status == "cardiac_pulm":
             myths_section.append(Paragraph("<b><i>\u201CWhen can I start after a procedure?\u201D</i></b>", myth_style))
             myths_section.append(Paragraph(
                 "Always follow your healthcare provider\u2019s guidance on when to begin using compression "
