@@ -779,6 +779,95 @@ class ConversationManager:
         updated_data.update(new_data)
         self.states[session_id] = UserSessionState(**updated_data)
 
+    # ══════════════════════════════════════════════════════════════
+    # COHERENCE VALIDATOR — ensures the state tells a consistent story
+    # ══════════════════════════════════════════════════════════════
+
+    _GOAL_TITLES = {
+        "travel": "Your Travel Comfort Protocol",
+        "pregnancy": "Your Pregnancy Wellness Protocol",
+        "postop": "Your Post-Surgery Recovery Protocol",
+        "recovery": "Your Exercise Recovery Protocol",
+        "skin": "Your Skin & Firmness Protocol",
+        "lighter": "Your Swelling & Heaviness Protocol",
+        "wellness": "Your Lymphatic Wellness Protocol",
+    }
+
+    _GOAL_CONTEXT_MAP = {
+        "travel": "travel",
+        "pregnancy": "pregnancy",
+        "postop": "surgery",
+        "recovery": "training",
+    }
+
+    _PROFILE_DENY_LISTS = {
+        "wheelchair": ["Structured Calf Pump", "Standing Calf Raises", "Afternoon Walk", "Aerobic Movement"],
+        "balance": ["Structured Calf Pump", "Standing Calf Raises", "Afternoon Walk", "Aerobic Movement"],
+        "arms": ["Upper Body Pump Circuit", "Arm Circles", "Overhead Stretch"],
+    }
+
+    def _validate_and_fix_coherence(self, session_id: str, protocol_items: list, title: str) -> tuple:
+        """
+        Validate that state, protocol items, and title are coherent.
+        Auto-corrects what it can, logs what it can't.
+        Returns (fixed_title, fixed_items, warnings).
+        """
+        state = self.get_state(session_id)
+        goal_key = state.goal_key or ""
+        warnings = []
+
+        # --- 1. Goal ↔ Title ---
+        expected_title = self._GOAL_TITLES.get(goal_key)
+        if expected_title and expected_title.lower() not in title.lower():
+            warnings.append(f"Coherence: Title '{title}' doesn't match goal '{goal_key}'. Auto-corrected to '{expected_title}'.")
+            title = expected_title
+
+        # --- 2. Goal ↔ Context Trigger ---
+        expected_ctx = self._GOAL_CONTEXT_MAP.get(goal_key)
+        if expected_ctx and state.context_trigger != expected_ctx:
+            warnings.append(f"Coherence: context_trigger='{state.context_trigger}' doesn't match goal '{goal_key}'. Auto-corrected to '{expected_ctx}'.")
+            self.update_state(session_id, {"context_trigger": expected_ctx})
+
+        # --- 3. Profile ↔ Protocol Items (deny-list safety net) ---
+        if state.ability_profile and state.ability_profile.accessibility_needs:
+            for need in state.ability_profile.accessibility_needs:
+                deny_list = self._PROFILE_DENY_LISTS.get(need, [])
+                filtered = []
+                for item in protocol_items:
+                    action = item.get("action", "")
+                    if action in deny_list:
+                        warnings.append(f"Coherence: Removed '{action}' — contraindicated for '{need}'.")
+                    else:
+                        filtered.append(item)
+                protocol_items = filtered
+
+        # --- 4. Dose sanity — no timed exercise under 2 min, no reps under 10 ---
+        import re as _re
+        for item in protocol_items:
+            dose = str(item.get("details", ""))
+            name = item.get("action", "")
+            min_match = _re.search(r'(\d+)\s*min', dose, _re.IGNORECASE)
+            if min_match and int(min_match.group(1)) < 2:
+                warnings.append(f"Coherence: '{name}' has dose '{dose}' under 2 min floor.")
+            reps_match = _re.search(r'(\d+)\s*rep', dose, _re.IGNORECASE)
+            if reps_match and int(reps_match.group(1)) < 10:
+                warnings.append(f"Coherence: '{name}' has dose '{dose}' under 10 rep floor.")
+
+        # --- 5. Tolerance ↔ Tier consistency ---
+        if state.ability_profile:
+            ap = state.ability_profile
+            if ap.exercise_tolerance and ap.tier not in ("cardiac_pulm", "sedentary"):
+                warnings.append(f"Coherence: tolerance='{ap.exercise_tolerance}' set but tier='{ap.tier}' (non-clinical). Tolerance may be ignored.")
+            if ap.pregnancy_trimester and ap.tier != "pregnant":
+                warnings.append(f"Coherence: trimester='{ap.pregnancy_trimester}' set but tier='{ap.tier}' (not pregnant). Trimester may be ignored.")
+
+        # Log warnings
+        if warnings:
+            for w in warnings:
+                logger.warning(w)
+
+        return title, protocol_items, warnings
+
     async def process_turn(self, session_id: str, user_msg: str, user_email: Optional[str] = None) -> str:
         import time
         _start_time = time.time()
@@ -1254,23 +1343,40 @@ class ConversationManager:
         """
         msg_lower = msg.lower()
         
-        # --- A. Context Detection ---
+        # --- A. Context Detection (Goal-Aware) ---
         is_photo = "photo" in msg_lower or "analyzing tissue" in msg_lower or "jpg" in msg_lower
-        
-        # Detect Body Part / Issue
-        issue_type = "foundation" # Default
+
+        # Consult goal_key FIRST — this is what the user explicitly chose
+        state = self.get_state(session_id)
+        _GOAL_TO_ISSUE = {
+            "travel": "legs",
+            "pregnancy": "legs",
+            "postop": "post_op",
+            "recovery": "recovery",
+            "skin": "foundation",
+            "wellness": "foundation",
+            "lighter": None,  # Detect from message (could be legs, arms, etc.)
+        }
+        goal_issue = _GOAL_TO_ISSUE.get(state.goal_key)
+
+        # Detect region hits from message for secondary context (empathy, multi-region)
         region_hits = set()
-        if any(w in msg_lower for w in ["surgery", "post-op", "post_op", "postop", "lipo", "recovery"]):
-            issue_type = "post_op"
         if any(w in msg_lower for w in ["leg", "ankle", "foot", "feet", "calf", "calves", "cankle"]):
             region_hits.add("legs")
         if any(w in msg_lower for w in ["arm", "hand", "finger", "elbow"]):
             region_hits.add("arms")
         if any(w in msg_lower for w in ["neck", "face", "jaw"]):
             region_hits.add("neck")
-        if issue_type != "post_op":
-            if len(region_hits) > 1:
-                # Make human-readable: "legs and arms" instead of "multi"
+
+        if goal_issue:
+            # Goal provides the issue_type — don't let keyword detection override it
+            issue_type = goal_issue
+        else:
+            # Fallback: keyword detection for "lighter" (swelling) and unknown goals
+            issue_type = "foundation"
+            if any(w in msg_lower for w in ["surgery", "post-op", "post_op", "postop", "lipo"]):
+                issue_type = "post_op"
+            elif len(region_hits) > 1:
                 region_list = sorted(list(region_hits))
                 if len(region_list) == 2:
                     issue_type = f"{region_list[0]} and {region_list[1]}"
@@ -2336,18 +2442,14 @@ class ConversationManager:
                 self.update_state(session_id, {"protocol_items": protocol_items, "agreed_protocol": ["Whole-Body Foundation Stack"]})
                 state = self.get_state(session_id)
 
-            # Build a goal-aware title instead of just the clinical protocol name
-            _GOAL_TITLES = {
-                "travel": "Your Travel Comfort Protocol",
-                "pregnancy": "Your Pregnancy Wellness Protocol",
-                "postop": "Your Post-Surgery Recovery Protocol",
-                "recovery": "Your Exercise Recovery Protocol",
-                "skin": "Your Skin & Firmness Protocol",
-                "lighter": "Your Swelling & Heaviness Protocol",
-                "wellness": "Your Lymphatic Wellness Protocol",
-            }
-            title = _GOAL_TITLES.get(state.goal_key, state.agreed_protocol[0] if state.agreed_protocol else "Your Lymphatic Wellness Focus")
+            # Goal-aware title
+            title = self._GOAL_TITLES.get(state.goal_key, state.agreed_protocol[0] if state.agreed_protocol else "Your Lymphatic Wellness Focus")
             user_name = state.user_name or "Valued Client"
+
+            # Run coherence validator before PDF generation
+            title, protocol_items, coherence_warnings = self._validate_and_fix_coherence(
+                session_id, protocol_items, title)
+
             pdf_path = None
             try:
                 pdf_path = self.protocol_gen.generate_pdf(
