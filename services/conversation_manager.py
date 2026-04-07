@@ -2336,7 +2336,17 @@ class ConversationManager:
                 self.update_state(session_id, {"protocol_items": protocol_items, "agreed_protocol": ["Whole-Body Foundation Stack"]})
                 state = self.get_state(session_id)
 
-            title = state.agreed_protocol[0] if state.agreed_protocol else "Your Lymphatic Wellness Focus"
+            # Build a goal-aware title instead of just the clinical protocol name
+            _GOAL_TITLES = {
+                "travel": "Your Travel Comfort Protocol",
+                "pregnancy": "Your Pregnancy Wellness Protocol",
+                "postop": "Your Post-Surgery Recovery Protocol",
+                "recovery": "Your Exercise Recovery Protocol",
+                "skin": "Your Skin & Firmness Protocol",
+                "lighter": "Your Swelling & Heaviness Protocol",
+                "wellness": "Your Lymphatic Wellness Protocol",
+            }
+            title = _GOAL_TITLES.get(state.goal_key, state.agreed_protocol[0] if state.agreed_protocol else "Your Lymphatic Wellness Focus")
             user_name = state.user_name or "Valued Client"
             pdf_path = None
             try:
