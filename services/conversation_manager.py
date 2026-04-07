@@ -1783,15 +1783,32 @@ class ConversationManager:
 
         profile.intake_completed = True
 
+        # Pre-fill discovery slots based on goal_key to skip redundant questions
+        goal_key = state.goal_key or ""
+        prefill = {}
+        if goal_key == "travel":
+            prefill = {"primary_region": "legs", "context_trigger": "travel", "timing": "variable",
+                       "discovery_slots": {"region": True, "context": True, "timing": True}}
+        elif goal_key == "pregnancy":
+            prefill = {"primary_region": "legs", "context_trigger": "pregnancy", "timing": "variable",
+                       "discovery_slots": {"region": True, "context": True, "timing": True}}
+        elif goal_key == "postop":
+            prefill = {"context_trigger": "surgery",
+                       "discovery_slots": {"context": True}}
+        elif goal_key == "recovery":
+            prefill = {"context_trigger": "training",
+                       "discovery_slots": {"context": True}}
+
         self.update_state(session_id, {
             "ability_profile": profile,
             "ability_intake_stage": None,
             "pending_ability_followup": None,
             "stage": "discovery",
             "discovery_permission_granted": True,
-            "discovery_permission_asked": True
+            "discovery_permission_asked": True,
+            **prefill,
         })
-        
+
         # Save to CRM
         if self.crm and state.user_email:
             try:
@@ -1809,7 +1826,24 @@ class ConversationManager:
                 logging.getLogger("ElastiqueBot").error(f"CRM Update Failed in _complete_ability_intake: {e}")
         
         try:
-            return AbilityIntakeHandler.get_intake_complete_message(profile, state.user_name or "friend", GOAL_OPTIONS)
+            # Check if all discovery slots are pre-filled (travel, pregnancy)
+            state = self.get_state(session_id)
+            all_slots_ready = state.primary_region and state.context_trigger and state.timing
+
+            if all_slots_ready:
+                # All slots pre-filled — generate protocol immediately
+                summary_msg = AbilityIntakeHandler.get_intake_complete_message(
+                    profile, state.user_name or "friend", ready_to_generate=True)
+
+                # Build and return protocol + PDF in one shot
+                synthetic_msg = f"{state.primary_region} {state.context_trigger} {state.timing}"
+                protocol_response = self._handle_diagnosis_v3(session_id, synthetic_msg)
+                state = self.get_state(session_id)
+                pdf_msg = self._handle_agreement(session_id, "yes")
+
+                return f"{summary_msg}\n\n---\n\n{pdf_msg}"
+
+            return AbilityIntakeHandler.get_intake_complete_message(profile, state.user_name or "friend")
         except Exception as e:
             import logging
             logging.getLogger("ElastiqueBot").error(f"Error building intake summary: {e}")

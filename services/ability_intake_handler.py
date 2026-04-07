@@ -345,12 +345,19 @@ class AbilityIntakeHandler:
         return "\n".join(parts)
 
     @staticmethod
-    def get_intake_complete_message(profile: UserAbilityProfile, user_name: str, goal_options: str = "") -> str:
+    def get_intake_complete_message(profile: UserAbilityProfile, user_name: str, goal_options: str = "", ready_to_generate: bool = False) -> str:
         """
         Message shown when ability intake is complete.
-        Summarizes profile and transitions to discovery.
+        Summarizes profile and transitions to discovery or protocol generation.
         """
         summary = AbilityIntakeHandler.build_profile_summary(profile)
+
+        if ready_to_generate:
+            return (
+                f"Thanks {user_name}! Here's your profile:\n\n"
+                f"{summary}\n\n"
+                f"I have everything I need. Building your personalized protocol now..."
+            )
 
         return (
             f"Thanks {user_name}! Here's your profile:\n\n"
