@@ -946,11 +946,11 @@ class ConversationManager:
             # Scenario 1: Active Session (Same Session ID)
             if state.user_name:
                 self.crm.log_interaction(session_id, "System", "Welcome Back trigger")
-                # Proceed directly to protocol flow - that's our mission
-                self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                # Return to goal capture so health intake runs before PDF
+                self.update_state(session_id, {"goal": "protocol", "stage": "goal_capture"})
                 response = (f"Welcome back, {state.user_name}! "
-                            "Let's continue building your personalized lymphatic wellness protocol.\n\n"
-                            f"What's the main concern you'd like to address today?\n\n{GOAL_OPTIONS}")
+                            "Let's build your personalized lymphatic wellness protocol.\n\n"
+                            f"What's the main concern you'd like to address?\n\n{GOAL_OPTIONS}")
                 return await self._finalize_response(session_id, user_msg, response)
             
             # Scenario 2: New Session + Known Email (Smart Retention)
@@ -976,22 +976,22 @@ class ConversationManager:
 
                     if protocol_url and protocol_summary:
                         # PDF was delivered - show summary, re-link PDF, offer new protocol
-                        self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                        self.update_state(session_id, {"goal": "protocol", "stage": "goal_capture"})
                         response = (f"Welcome back, {crm_name}! Last time I put together your **{protocol_summary}**.\n\n"
                                     f"[Download your protocol again]({protocol_url})\n\n"
                                     f"Would you like to create **another protocol**?\n\n{GOAL_OPTIONS}")
                         return await self._finalize_response(session_id, user_msg, response)
                     elif intent:
                         # In-progress, no PDF yet - offer to resume
-                        self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+                        self.update_state(session_id, {"goal": "protocol", "stage": "goal_capture"})
                         response = (f"Welcome back, {crm_name}! Last time we were working on your "
                                     f"**tailored protocol for your {intent}**.\n\n"
                                     f"Would you like to **continue**, or start fresh?\n\n"
                                     f"○ Continue where we left off\n{GOAL_OPTIONS}")
                         return await self._finalize_response(session_id, user_msg, response)
-                
-                    # No specific protocol yet - proceed to protocol flow
-                    self.update_state(session_id, {"goal": "protocol", "stage": "discovery"})
+
+                    # No specific protocol yet - proceed to goal capture
+                    self.update_state(session_id, {"goal": "protocol", "stage": "goal_capture"})
                     response = (f"Welcome back, {crm_name}! "
                                 "Let's build your personalized lymphatic wellness protocol.\n\n"
                                 f"What's the main concern you'd like to address?\n\n{GOAL_OPTIONS}")
