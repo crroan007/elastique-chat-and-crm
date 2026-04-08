@@ -305,7 +305,8 @@ def detect_goal(text: str) -> Optional[str]:
     if any(k in t for k in ["shop", "buy", "purchase", "products", "leggings", "bra", "tank", "clothing"]):
         return "shop"
     if any(k in t for k in ["protocol", "routine", "help", "support", "wellness", "swelling", "pain", "recovery", "skin", "cellulite", "texture", "smoother", "firmer", "dimple",
-                             "travel", "flight", "comfort", "flying", "airplane", "pregnancy", "pregnant"]):
+                             "travel", "flight", "comfort", "flying", "airplane", "pregnancy", "pregnant",
+                             "surgery", "post-op", "lipo", "liposuction", "procedure", "tummy tuck", "bbl"]):
         return "protocol"
     return None
 
@@ -1206,6 +1207,10 @@ class ConversationManager:
                             updates["context_trigger"] = "travel"
                         elif gk == "pregnancy":
                             updates["context_trigger"] = "pregnancy"
+                        elif gk == "postop":
+                            updates["context_trigger"] = "surgery"
+                        elif gk == "recovery":
+                            updates["context_trigger"] = "training"
                         self.update_state(session_id, updates)
                         break
 
@@ -1721,28 +1726,34 @@ class ConversationManager:
             
             profile.tier = primary_tier
             profile.has_limb_limitations = has_limited_limbs
-            
+            # Track all selected health tiers for combo follow-ups (e.g. cardiac + pregnant)
+            profile.all_health_tiers = active_health_tiers
+
             self.update_state(session_id, {
                 "ability_profile": profile,
                 "intake_reprompt_count": 0
             })
-            
-            # Check if follow-up needed for tolerance/trimester (systemic health)
-            tier_info = ABILITY_TIERS.get(primary_tier, {})
-            if tier_info.get("needs_followup"):
-                followup_type = tier_info.get("followup_type")
-                if followup_type == "tolerance":
-                    self.update_state(session_id, {
-                        "ability_intake_stage": "tolerance_followup",
-                        "pending_ability_followup": "tolerance"
-                    })
-                    return AbilityIntakeHandler.get_tolerance_question()
-                elif followup_type == "trimester":
-                    self.update_state(session_id, {
-                        "ability_intake_stage": "trimester_followup",
-                        "pending_ability_followup": "trimester"
-                    })
-                    return AbilityIntakeHandler.get_trimester_question()
+
+            # Determine which follow-ups are needed based on ALL selected tiers
+            needs_tolerance = any(
+                ABILITY_TIERS.get(t, {}).get("followup_type") == "tolerance"
+                for t in active_health_tiers
+            )
+            needs_trimester = "pregnant" in active_health_tiers
+
+            # Ask tolerance first (if needed), then trimester will be checked after
+            if needs_tolerance:
+                self.update_state(session_id, {
+                    "ability_intake_stage": "tolerance_followup",
+                    "pending_ability_followup": "tolerance"
+                })
+                return AbilityIntakeHandler.get_tolerance_question()
+            elif needs_trimester:
+                self.update_state(session_id, {
+                    "ability_intake_stage": "trimester_followup",
+                    "pending_ability_followup": "trimester"
+                })
+                return AbilityIntakeHandler.get_trimester_question()
             
             # Always ask mobility — users who have no considerations can select "None" in one click
             self.update_state(session_id, {"ability_intake_stage": "mobility"})
@@ -1761,10 +1772,20 @@ class ConversationManager:
                 profile.exercise_tolerance = tolerance
                 self.update_state(session_id, {
                     "ability_profile": profile,
-                    "ability_intake_stage": "mobility",
                     "pending_ability_followup": None,
                     "intake_reprompt_count": 0
                 })
+
+                # Check if trimester is also needed (cardiac + pregnant combo)
+                all_tiers = getattr(profile, 'all_health_tiers', [])
+                if "pregnant" in all_tiers and not profile.pregnancy_trimester:
+                    self.update_state(session_id, {
+                        "ability_intake_stage": "trimester_followup",
+                        "pending_ability_followup": "trimester"
+                    })
+                    return AbilityIntakeHandler.get_trimester_question()
+
+                self.update_state(session_id, {"ability_intake_stage": "mobility"})
                 return AbilityIntakeHandler.get_mobility_question()
             else:
                 # Re-prompt
@@ -1862,8 +1883,9 @@ class ConversationManager:
                 # SIDE CLARIFICATION REMOVED: Competing intake immediately after wheelchair arms follow-up
                 return self._complete_ability_intake(session_id)
             else:
+                self.update_state(session_id, {"intake_reprompt_count": state.intake_reprompt_count + 1})
                 return "I didn't quite catch that. " + AbilityIntakeHandler.get_wheelchair_arms_question()
-        
+
         # SIDE CLARIFICATION STAGES REMOVED (side_arms, side_legs)
         
         # Fallback
@@ -2468,6 +2490,7 @@ class ConversationManager:
                         "pregnancy_trimester": state.ability_profile.pregnancy_trimester if state.ability_profile else None,
                         "mobility": state.ability_profile.accessibility_needs if state.ability_profile else [],
                         "accessibility_details": state.ability_profile.accessibility_details if state.ability_profile else {},
+                        "all_health_tiers": state.ability_profile.all_health_tiers if state.ability_profile else [],
                     },
                     citations=[url for item in protocol_items for url in (item.get("urls") or [])]
                 )

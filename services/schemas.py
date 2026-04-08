@@ -14,6 +14,7 @@ class UserAbilityProfile(BaseModel):
     accessibility_needs: List[str] = Field(default_factory=list)  # hands, arms, legs, wheelchair, balance, pain
     accessibility_details: Dict[str, Any] = Field(default_factory=dict)  # {hands: {side: "right"}, legs: {side: "both"}}
     has_limb_limitations: bool = False # Flag for "Limited use of limbs" modifier
+    all_health_tiers: List[str] = Field(default_factory=list)  # All selected health tiers (for combo follow-ups)
     intake_completed: bool = False
 
 

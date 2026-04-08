@@ -943,7 +943,8 @@ class ProtocolGenerator:
         ctx_trigger = (profile or {}).get("context_trigger", "")
         preg_tri = (profile or {}).get("pregnancy_trimester")
 
-        if preg_tri:
+        is_pregnant = preg_tri or health_status == "pregnant" or "pregnant" in (profile or {}).get("all_health_tiers", [])
+        if is_pregnant:
             myths_section.append(Paragraph("<b><i>\u201CIs compression safe during pregnancy?\u201D</i></b>", myth_style))
             myths_section.append(Paragraph(
                 "Compression garments designed to support comfort are widely used during pregnancy. "

@@ -243,7 +243,7 @@ class AbilityIntakeHandler:
     @staticmethod
     def parse_wheelchair_arms_response(msg: str) -> Optional[str]:
         """Parse wheelchair arm-use response."""
-        return parse_selection(msg, WHEELCHAIR_ARMS_OPTIONS, mode="single", none_id="yes")
+        return parse_selection(msg, WHEELCHAIR_ARMS_OPTIONS, mode="single")
 
 
     @staticmethod
